@@ -237,6 +237,17 @@ export interface SimFill {
   settleTick: number;
 }
 
+/** A listing that reached its TTL with stock left. The seller's cue to re-price. */
+export interface SimExpiry {
+  channel: string;
+  offerId: string;
+  sku: string;
+  priceMinor: Minor;
+  remaining: number;
+  listedTick: number;
+  expiredTick: number;
+}
+
 export interface SimCounters {
   listed: number;
   filled: number;
@@ -274,6 +285,7 @@ interface ChannelState {
   poolTick: number;
   active: Map<string, ActiveListing>;
   pending: SimFill[];
+  expiries: SimExpiry[];
   counters: SimCounters;
   seq: number;
 }
@@ -366,6 +378,7 @@ export class MarketSimulator {
       poolTick: -1,
       active: new Map(),
       pending: [],
+      expiries: [],
       counters: { listed: 0, filled: 0, expired: 0, feesMinor: 0, buys: 0, boughtUnits: 0 },
       seq: 0,
     };
@@ -485,6 +498,15 @@ export class MarketSimulator {
       } else if (tick >= l.expiresTick) {
         st.counters.expired += 1;
         st.active.delete(id);
+        st.expiries.push({
+          channel: st.name,
+          offerId: l.offerId,
+          sku: l.sku,
+          priceMinor: l.priceMinor,
+          remaining: l.remaining,
+          listedTick: l.listedTick,
+          expiredTick: tick,
+        });
         this.logger.debug('listing expired unsold', { channel: st.name, offerId: l.offerId, remaining: l.remaining });
       }
     }
@@ -600,9 +622,33 @@ export class MarketSimulator {
     return due;
   }
 
+  /** Listings that expired unsold since the previous call. Draining, like fills. */
+  collectExpiries(channel: string, tick: number): SimExpiry[] {
+    this.advanceTo(tick);
+    const st = this.state(channel);
+    const out = st.expiries;
+    st.expiries = [];
+    return out;
+  }
+
   /** Number of listings still live on a channel. */
   activeListings(channel: string): number {
     return this.state(channel).active.size;
+  }
+
+  /**
+   * Live state of one listing, or null once it sold out or expired. `remaining`
+   * drops the moment a sale happens — BEFORE the cash settles — which is how a
+   * seller distinguishes "sold, payout pending" from "still sitting there".
+   */
+  listingState(channel: string, offerId: string): Readonly<ActiveListing> | null {
+    const l = this.state(channel).active.get(offerId);
+    return l ? { ...l } : null;
+  }
+
+  /** Every listing still live on a channel. */
+  openListings(channel: string): Readonly<ActiveListing>[] {
+    return [...this.state(channel).active.values()].map((l) => ({ ...l }));
   }
 
   counters(channel?: string): SimCounters {
@@ -808,6 +854,28 @@ export abstract class SimulatedChannelAdapter implements ChannelAdapter {
     this.assertReady('demandSignal');
     this.assertCurrency(price, 'demandSignal');
     return this.sim.sellThrough(this.name, sku, price.amount, tick);
+  }
+
+  /**
+   * Live state of a listing this adapter published, keyed by the offerId that
+   * publish() returned. Null once it has sold out or expired. The seller needs
+   * this to tell "sold, payout still settling" from "unsold, re-price it".
+   */
+  listingStatus(offerId: string): { remaining: number; listedTick: number; expiresTick: number; priceMinor: Minor } | null {
+    this.assertReady('listingStatus');
+    const l = this.sim.listingState(this.name, offerId);
+    return l
+      ? { remaining: l.remaining, listedTick: l.listedTick, expiresTick: l.expiresTick, priceMinor: l.priceMinor }
+      : null;
+  }
+
+  /**
+   * Listings that hit their TTL with stock unsold, drained since the previous
+   * call — the seller's cue to re-price or write off. Poll-once, like poll().
+   */
+  async pollExpired(tick: number): Promise<SimExpiry[]> {
+    this.assertReady('pollExpired');
+    return this.sim.collectExpiries(this.name, tick);
   }
 
   counters(): SimCounters {

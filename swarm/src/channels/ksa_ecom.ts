@@ -108,7 +108,7 @@ export class KsaEcomAdapter extends SimulatedChannelAdapter {
    * BEFORE the init/ready check, so a mis-wired caller, a replayed idempotency
    * key or a policy engine bug can never turn into an automated purchase.
    */
-  override async buy(o?: Opportunity, qty?: number, tick?: number, idem?: string): Promise<{ holding: Holding; feeMinor: Minor }> {
+  override async buy(o: Opportunity, qty: number, tick: number, idem: string): Promise<{ holding: Holding; feeMinor: Minor }> {
     throw new PolicyDenied(
       'TOS_AUTOMATED_PURCHASE_PROHIBITED',
       `${this.name}.buy() refused: automated purchasing is prohibited by the terms of service of the ` +
@@ -123,6 +123,7 @@ export class KsaEcomAdapter extends SimulatedChannelAdapter {
         qty: qty ?? null,
         tick: tick ?? null,
         idem: idem ?? null,
+        note: 'this refusal precedes the init/ready check on purpose',
       },
     );
   }

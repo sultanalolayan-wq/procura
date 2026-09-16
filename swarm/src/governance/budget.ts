@@ -491,6 +491,8 @@ export class BudgetGovernor {
 
   /** Spendable cash for an agent: the tightest of agent cap, global cap, till. */
   availableCash(agentId: AgentId): Minor {
+    // Fail closed: a halted swarm has nothing to spend, whatever the caps say.
+    if (this.killSwitch.tripped) return 0;
     const row = this.agents.get(agentId);
     if (row === undefined || row.terminated) return 0;
     const agentFree = row.cashCapMinor - row.cashSpentMinor - this.outstandingFor(agentId, 'cash');
@@ -501,6 +503,7 @@ export class BudgetGovernor {
   }
 
   availableTokens(agentId: AgentId): number {
+    if (this.killSwitch.tripped) return 0;
     const row = this.agents.get(agentId);
     if (row === undefined || row.terminated) return 0;
     const agentFree = row.tokenCap - row.tokensUsed - this.outstandingFor(agentId, 'tokens');

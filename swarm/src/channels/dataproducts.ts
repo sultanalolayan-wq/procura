@@ -119,12 +119,12 @@ export class DataProductsAdapter extends SimulatedChannelAdapter {
   }
 
   /** There is no acquisition path on this channel; mint() is the way in. */
-  override async buy(): Promise<{ holding: Holding; feeMinor: Minor }> {
+  override async buy(o: Opportunity, qty: number, tick: number, idem: string): Promise<{ holding: Holding; feeMinor: Minor }> {
     this.assertReady('buy');
     throw new AdapterError(
       'CHANNEL_CANNOT_BUY',
       `${this.name}: this channel cannot buy — data products are minted at zero cost via mint()`,
-      { channel: this.name },
+      { channel: this.name, sku: o?.sku ?? null, qty, tick, idem },
     );
   }
 
