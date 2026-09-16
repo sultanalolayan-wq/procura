@@ -1,6 +1,6 @@
 node_modules/
 dist/
-var/
+var/*
 !var/.gitkeep
 *.tsbuildinfo
 .env

@@ -16,10 +16,12 @@ class SystemClock implements Clock {
   }
   sleep(ms: number): Promise<void> {
     if (!Number.isFinite(ms) || ms <= 0) return Promise.resolve();
+    // Deliberately NOT unref'd: the supervisor's inter-tick sleep is the only
+    // pending work between ticks, and an unref'd timer would let the process
+    // exit silently mid-run. Shutdown is driven by supervisor.stop(), not by
+    // starving the event loop.
     return new Promise<void>((resolve) => {
-      const t = setTimeout(resolve, ms);
-      // Do not keep the event loop alive purely for a sleep.
-      if (typeof t === 'object' && t !== null && 'unref' in t) (t as { unref(): void }).unref();
+      setTimeout(resolve, ms);
     });
   }
 }
