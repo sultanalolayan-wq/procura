@@ -8,7 +8,7 @@
 import type { Minor, Money } from './money.js';
 
 export type AgentId = string;
-export type AgentRole = 'scout' | 'seller' | 'treasury' | 'orchestrator';
+export type AgentRole = 'scout' | 'seller' | 'treasury' | 'orchestrator' | 'trader';
 export type AgentStatus = 'active' | 'probation' | 'quarantined' | 'terminated';
 
 export interface Opportunity {

@@ -8,6 +8,11 @@
 import { ConfigError } from './errors.js';
 import { isCurrency, type Currency, type Minor } from './money.js';
 import { isLevel, type Level } from './logger.js';
+// Type-only for Venue (erased at compile time) and one pure date predicate.
+// market/feed.ts imports nothing from config, so there is no cycle in either
+// direction — the market block is additive and self-contained.
+import { isDayUtc } from '../market/feed.js';
+import type { Venue } from '../market/feed.js';
 
 export interface AresConfig {
   mode: 'PAPER';
@@ -49,7 +54,89 @@ export interface AresConfig {
     maxAgentCrashes: number;
   };
   channels: string[];
+  market: MarketConfig;
 }
+
+/* ------------------------------------------------------------ market block */
+
+/**
+ * Cost parameters for ONE venue. Every number that separates a printed price
+ * from the cash that actually moves is here, named, and none of it is buried as
+ * a magic number anywhere else. Shape-identical to VenueCostModel in
+ * channels/equities.ts; kept structural here so config stays dependency-free.
+ *
+ * UNVERIFIED ASSUMPTIONS. The defaults are plausible retail figures chosen to be
+ * pessimistic rather than flattering; no broker tariff has been read or verified.
+ * The operator replaces them with their own broker's schedule.
+ */
+export interface VenueCostConfig {
+  /** Commission per SIDE, in basis points of notional. */
+  commissionBps: number;
+  /** Floor on the per-side commission, in minor units of the venue's currency. */
+  minCommissionMinor: Minor;
+  /** Half the quoted bid-ask, charged adversely on every fill, in bps. */
+  halfSpreadBps: number;
+  /** Adverse move between decision and execution, in bps. */
+  slippageBps: number;
+  /** Settlement delay in SESSIONS, not calendar days. T+2 by default. */
+  settlementSessions: number;
+  /** Minimum tradeable increment, in shares. */
+  lotSize: number;
+}
+
+export interface MarketConfig {
+  /** Master switch. OFF by default: no market module runs unless asked for. */
+  enabled: boolean;
+  /** First session of the run (YYYY-MM-DD), or null to let the caller choose. */
+  startDay: string | null;
+  /**
+   * Nominal run length in SESSIONS. It is applied PER VENUE, and ten US sessions
+   * and ten Tadawul sessions are different calendar windows — the run controller
+   * reports both.
+   */
+  sessions: number;
+  /** Instrument universe per venue. Empty means "the caller must supply one". */
+  symbols: Record<Venue, string[]>;
+  /**
+   * Exchange holidays per venue, operator-supplied. SHIPS EMPTY ON PURPOSE: a
+   * stale hardcoded holiday list is worse than none because it is believed. See
+   * market/calendar.ts DEFAULT_HOLIDAYS for the full reasoning.
+   */
+  holidays: Record<Venue, string[]>;
+  costs: Record<Venue, VenueCostConfig>;
+  fx: {
+    /** SAR per USD, as a number for arithmetic. */
+    sarPerUsd: number;
+    /** The same rate as an exact integer count of millionths, for auditing. */
+    sarPerUsdMicros: number;
+    /** Why this is an assumption and not a constant. */
+    note: string;
+  };
+  http: {
+    /** Host allowlist. EMPTY BY DEFAULT: deny everything until told otherwise. */
+    hosts: string[];
+    timeoutMs: number;
+    maxBytes: number;
+    maxRedirects: number;
+    perMinute: number;
+    failureThreshold: number;
+    cooldownMs: number;
+    halfOpenMax: number;
+  };
+  csv: { maxBytes: number; maxRows: number };
+}
+
+/**
+ * CONFIGURED ASSUMPTION — NOT A LAW OF NATURE, and labelled here exactly as the
+ * VAT rate is labelled in channels/ksa_ecom.ts. The riyal's peg to the dollar is
+ * a central-bank policy; policies change, and a rate that has held for decades is
+ * still a decision rather than a constant.
+ */
+export const FX_SAR_PER_USD_NOTE =
+  'CONFIGURABLE ASSUMPTION, PENDING OPERATOR CONFIRMATION: ARES_MARKET_FX_SAR_PER_USD is a ' +
+  'single fixed rate applied to every conversion. No live rate is fetched and no conversion ' +
+  'spread is modelled. The SAR/USD peg is a policy of the Saudi Central Bank, not a law of ' +
+  'nature, and cross-currency P&L is only as good as this one number.';
 
 export type Env = Record<string, string | undefined>;
 
@@ -101,6 +188,144 @@ function intOf(env: Env, key: string, def: number, p: Problems, opts: { min?: nu
     return def;
   }
   return n;
+}
+
+/* --------------------------------------------------- market block helpers -- */
+
+/** Comma-separated list -> trimmed, de-duplicated, non-empty entries. */
+function listOf(env: Env, key: string, def: string, p: Problems): string[] {
+  const v = raw(env, key) ?? def;
+  const items = v
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (new Set(items).size !== items.length) p.add(`${key}: duplicate entries in ${JSON.stringify(v)}`);
+  return [...new Set(items)];
+}
+
+function boolOf(env: Env, key: string, def: boolean, p: Problems): boolean {
+  const v = raw(env, key);
+  if (v === undefined) return def;
+  const t = v.toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(t)) return true;
+  if (['0', 'false', 'no', 'off'].includes(t)) return false;
+  p.add(`${key}: expected a boolean (true/false), got ${JSON.stringify(v)}`);
+  return def;
+}
+
+/**
+ * A decimal rate parsed into an EXACT integer count of millionths. There is no
+ * float parsing here and no silent rounding: "3.75" is 3_750_000 micros, and a
+ * rate with more than six decimal places is refused rather than truncated, for
+ * the same reason market/feed.ts refuses a price it cannot hold exactly.
+ */
+function microsOf(env: Env, key: string, def: string, p: Problems): number {
+  const v = raw(env, key) ?? def;
+  const m = /^(\d+)(?:\.(\d{1,6}))?$/.exec(v);
+  if (m === null) {
+    p.add(`${key}: expected a positive decimal with at most 6 decimal places, got ${JSON.stringify(v)}`);
+    return 0;
+  }
+  const micros = Number(`${m[1]}${(m[2] ?? '').padEnd(6, '0')}`);
+  if (!Number.isSafeInteger(micros) || micros <= 0) {
+    p.add(`${key}: ${JSON.stringify(v)} must be greater than zero`);
+    return 0;
+  }
+  return micros;
+}
+
+/** A YYYY-MM-DD list, each entry checked against the real calendar. */
+function daysOf(env: Env, key: string, p: Problems): string[] {
+  const items = listOf(env, key, '', p);
+  for (const d of items) {
+    if (!isDayUtc(d)) p.add(`${key}: ${JSON.stringify(d)} is not a real YYYY-MM-DD date`);
+  }
+  return items;
+}
+
+/** Per-venue cost block. Every field is an ARES_MARKET_<VENUE>_* variable. */
+function costsOf(env: Env, venue: Venue, p: Problems, def: VenueCostConfig): VenueCostConfig {
+  const k = (suffix: string): string => `ARES_MARKET_${venue}_${suffix}`;
+  return {
+    commissionBps: intOf(env, k('COMMISSION_BPS'), def.commissionBps, p, { min: 0, max: 10_000 }),
+    minCommissionMinor: intOf(env, k('MIN_COMMISSION'), def.minCommissionMinor, p, { min: 0 }),
+    halfSpreadBps: intOf(env, k('HALF_SPREAD_BPS'), def.halfSpreadBps, p, { min: 0, max: 10_000 }),
+    slippageBps: intOf(env, k('SLIPPAGE_BPS'), def.slippageBps, p, { min: 0, max: 10_000 }),
+    settlementSessions: intOf(env, k('SETTLEMENT_SESSIONS'), def.settlementSessions, p, { min: 0, max: 30 }),
+    lotSize: intOf(env, k('LOT_SIZE'), def.lotSize, p, { min: 1 }),
+  };
+}
+
+/** Defaults justified in channels/equities.ts DEFAULT_COSTS. */
+const DEFAULT_VENUE_COSTS: Readonly<Record<Venue, VenueCostConfig>> = Object.freeze({
+  US: Object.freeze({
+    commissionBps: 10,
+    minCommissionMinor: 100,
+    halfSpreadBps: 2,
+    slippageBps: 3,
+    settlementSessions: 2,
+    lotSize: 1,
+  }),
+  TADAWUL: Object.freeze({
+    commissionBps: 16,
+    minCommissionMinor: 100,
+    halfSpreadBps: 5,
+    slippageBps: 5,
+    settlementSessions: 2,
+    lotSize: 1,
+  }),
+});
+
+/**
+ * The market block. It is entirely additive: with ARES_MARKET_ENABLED unset the
+ * defaults describe a module that reaches nothing (empty host allowlist), trades
+ * nothing (empty symbol lists) and assumes no holidays it was not given.
+ */
+function marketOf(env: Env, p: Problems): MarketConfig {
+  const enabled = boolOf(env, 'ARES_MARKET_ENABLED', false, p);
+  const startRaw = raw(env, 'ARES_MARKET_START_DAY') ?? null;
+  if (startRaw !== null && !isDayUtc(startRaw)) {
+    p.add(`ARES_MARKET_START_DAY: expected a real YYYY-MM-DD date, got ${JSON.stringify(startRaw)}`);
+  }
+  const micros = microsOf(env, 'ARES_MARKET_FX_SAR_PER_USD', '3.75', p);
+  const hosts = listOf(env, 'ARES_MARKET_HOSTS', '', p).map((h) => h.toLowerCase());
+  for (const h of hosts) {
+    if (h.includes('/') || h.includes(':') || h.includes('*')) {
+      p.add(`ARES_MARKET_HOSTS: ${JSON.stringify(h)} must be a bare hostname (no scheme, port or wildcard)`);
+    }
+  }
+  return {
+    enabled,
+    startDay: startRaw !== null && isDayUtc(startRaw) ? startRaw : null,
+    sessions: intOf(env, 'ARES_MARKET_SESSIONS', 10, p, { min: 2, max: 2_000 }),
+    symbols: {
+      US: listOf(env, 'ARES_MARKET_US_SYMBOLS', '', p),
+      TADAWUL: listOf(env, 'ARES_MARKET_TADAWUL_SYMBOLS', '', p),
+    },
+    holidays: {
+      US: daysOf(env, 'ARES_MARKET_US_HOLIDAYS', p),
+      TADAWUL: daysOf(env, 'ARES_MARKET_TADAWUL_HOLIDAYS', p),
+    },
+    costs: {
+      US: costsOf(env, 'US', p, DEFAULT_VENUE_COSTS.US),
+      TADAWUL: costsOf(env, 'TADAWUL', p, DEFAULT_VENUE_COSTS.TADAWUL),
+    },
+    fx: { sarPerUsd: micros / 1_000_000, sarPerUsdMicros: micros, note: FX_SAR_PER_USD_NOTE },
+    http: {
+      hosts,
+      timeoutMs: intOf(env, 'ARES_MARKET_HTTP_TIMEOUT_MS', 8_000, p, { min: 100, max: 120_000 }),
+      maxBytes: intOf(env, 'ARES_MARKET_HTTP_MAX_BYTES', 2_000_000, p, { min: 1_024 }),
+      maxRedirects: intOf(env, 'ARES_MARKET_HTTP_MAX_REDIRECTS', 2, p, { min: 0, max: 10 }),
+      perMinute: intOf(env, 'ARES_MARKET_HTTP_PER_MIN', 30, p, { min: 1 }),
+      failureThreshold: intOf(env, 'ARES_MARKET_HTTP_FAILURES', 3, p, { min: 1 }),
+      cooldownMs: intOf(env, 'ARES_MARKET_HTTP_COOLDOWN_MS', 60_000, p, { min: 0 }),
+      halfOpenMax: intOf(env, 'ARES_MARKET_HTTP_HALF_OPEN_MAX', 1, p, { min: 1 }),
+    },
+    csv: {
+      maxBytes: intOf(env, 'ARES_MARKET_CSV_MAX_BYTES', 33_554_432, p, { min: 1_024 }),
+      maxRows: intOf(env, 'ARES_MARKET_CSV_MAX_ROWS', 200_000, p, { min: 1 }),
+    },
+  };
 }
 
 export function loadConfig(env: Env = process.env): AresConfig {
@@ -208,6 +433,16 @@ export function loadConfig(env: Env = process.env): AresConfig {
   if (channels.length === 0) p.add(`ARES_CHANNELS: at least one channel name is required`);
   if (new Set(channels).size !== channels.length) p.add(`ARES_CHANNELS: duplicate channel names in ${channelsRaw}`);
 
+  const market = marketOf(env, p);
+  if (market.enabled) {
+    // Only enforced when the module is actually switched on: an operator who has
+    // not asked for market data should not have to configure it.
+    if (market.startDay === null) p.add('ARES_MARKET_START_DAY is required when ARES_MARKET_ENABLED is true');
+    if (market.symbols.US.length === 0 && market.symbols.TADAWUL.length === 0) {
+      p.add('ARES_MARKET_ENABLED is true but neither ARES_MARKET_US_SYMBOLS nor ARES_MARKET_TADAWUL_SYMBOLS names an instrument');
+    }
+  }
+
   if (p.list.length > 0) {
     throw new ConfigError(
       'CONFIG_INVALID',
@@ -231,6 +466,7 @@ export function loadConfig(env: Env = process.env): AresConfig {
     survival,
     limits,
     channels,
+    market,
   };
   return deepFreeze(cfg);
 }
