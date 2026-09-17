@@ -142,11 +142,16 @@ export function loadConfig(env: Env = process.env): AresConfig {
     p.add(`ARES_AGENT_TOKEN_CAP (${budget.perAgentTokenCap}) must not exceed ARES_TOKEN_CAP (${budget.globalTokenCap})`);
   }
 
+  // The three survival guards all have a floor of 0 ON PURPOSE: 0 is the
+  // operator's literal zero-tolerance policy (no grace period, no statistical
+  // floor, terminate on the first failing mature window) and a policy that
+  // cannot be expressed in the environment is not really a policy. The defaults
+  // keep the guards on; setting them to 0 is a deliberate, auditable choice.
   const survival = {
     windowTicks: intOf(env, 'ARES_WINDOW_TICKS', 20, p, { min: 1 }),
     graceWindows: intOf(env, 'ARES_GRACE_WINDOWS', 2, p, { min: 0 }),
-    minSamples: intOf(env, 'ARES_MIN_SAMPLES', 8, p, { min: 1 }),
-    probationWindows: intOf(env, 'ARES_PROBATION_WINDOWS', 1, p, { min: 1 }),
+    minSamples: intOf(env, 'ARES_MIN_SAMPLES', 8, p, { min: 0 }),
+    probationWindows: intOf(env, 'ARES_PROBATION_WINDOWS', 1, p, { min: 0 }),
     minNetMinor: intOf(env, 'ARES_MIN_NET', 0, p),
   };
 

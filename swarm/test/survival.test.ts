@@ -264,3 +264,76 @@ test('an unseen agent evaluates cleanly instead of throwing', () => {
     h.close();
   }
 });
+
+/* ------------------------------ AMENDMENT A2: the probationWindows -> streak map */
+
+test('probationWindows=0 TERMINATES on the very first failing mature window', () => {
+  const h = harness({ ...NO_GRACE, ARES_PROBATION_WINDOWS: '0' });
+  try {
+    assert.equal(h.cfg.survival.probationWindows, 0);
+    h.samples('a', 4);
+    h.post('a', 0, -1); // a single halala down is a failing window
+    const first = h.ev.evaluate('a', 0);
+    assert.equal(first.verdict, 'TERMINATE', 'zero tolerance: no warning step at all');
+    assert.equal(h.ev.state('a')?.failStreak, 1);
+    assert.match(first.reason, /probationWindows=0/);
+  } finally {
+    h.close();
+  }
+});
+
+test('probationWindows=0 still cannot terminate an IMMATURE agent', () => {
+  // The grace guard is orthogonal to the probation mapping: cold-start immunity
+  // must survive the harshest possible probation setting.
+  const h = harness({ ARES_PROBATION_WINDOWS: '0' });
+  try {
+    h.samples('a', 20);
+    for (const t of [0, 20, 40]) h.post('a', t, -9_000);
+    assert.equal(h.ev.evaluate('a', 0).verdict, 'IMMATURE');
+    assert.equal(h.ev.evaluate('a', 20).verdict, 'IMMATURE');
+    assert.equal(h.ev.evaluate('a', 40).verdict, 'TERMINATE', 'fatal only once mature');
+  } finally {
+    h.close();
+  }
+});
+
+test('probationWindows=1 keeps the documented warn-then-terminate behaviour', () => {
+  const h = harness({ ...NO_GRACE, ARES_PROBATION_WINDOWS: '1' });
+  try {
+    h.samples('a', 4);
+    h.post('a', 0, -100);
+    h.post('a', 20, -100);
+    assert.equal(h.ev.evaluate('a', 0).verdict, 'PROBATION');
+    assert.equal(h.ev.evaluate('a', 20).verdict, 'TERMINATE');
+  } finally {
+    h.close();
+  }
+});
+
+test('probationWindows=2 tolerates two failing windows before terminating', () => {
+  const h = harness({ ...NO_GRACE, ARES_PROBATION_WINDOWS: '2' });
+  try {
+    h.samples('a', 4);
+    h.post('a', 0, -100);
+    h.post('a', 20, -100);
+    h.post('a', 40, -100);
+    assert.equal(h.ev.evaluate('a', 0).verdict, 'PROBATION');
+    assert.equal(h.ev.evaluate('a', 20).verdict, 'PROBATION');
+    assert.equal(h.ev.evaluate('a', 40).verdict, 'TERMINATE');
+    assert.equal(h.ev.state('a')?.failStreak, 3);
+  } finally {
+    h.close();
+  }
+});
+
+test('a passing window clears the streak even under probationWindows=0', () => {
+  const h = harness({ ...NO_GRACE, ARES_PROBATION_WINDOWS: '0' });
+  try {
+    h.samples('a', 4);
+    h.post('a', 0, 500);
+    assert.equal(h.ev.evaluate('a', 0).verdict, 'PASS');
+    assert.equal(h.ev.state('a')?.failStreak, 0);
+  } finally {
+    h.close();
+  }
+});

@@ -10,6 +10,17 @@
  * terminated. Setting ARES_GRACE_WINDOWS=0 and ARES_MIN_SAMPLES=0 removes both
  * guards and restores the literal zero-tolerance behaviour.
  *
+ * probationWindows maps to a termination threshold on the CONSECUTIVE-failing-
+ * mature-window streak as follows:
+ *     probationWindows = 0  ->  TERMINATE on the 1st failing mature window
+ *                               (the operator's literal rule; PROBATION is
+ *                               never issued because there is no warning step)
+ *     probationWindows = 1  ->  PROBATION on the 1st, TERMINATE on the 2nd
+ *     probationWindows = n  ->  PROBATION on failures 1..n, TERMINATE on n+1
+ * i.e. the streak that is fatal is `max(1, probationWindows + 1)` for n >= 1
+ * and exactly 1 for n = 0. IMMATURE immunity is unaffected by this mapping: a
+ * cold-start agent is never terminated whatever probationWindows says.
+ *
  * Invariants: IMMATURE is never terminal; evaluate() decides a given window at
  * most once (keyed on floor(tick/windowTicks)) so repeated calls inside a
  * window cannot double-count toward termination; a passing window resets the
@@ -138,11 +149,14 @@ export class SurvivalEvaluator {
       reason = `net ${netMinor} met the benchmark ${s.minNetMinor} over window ${w} (ticks ${from}-${to})`;
     } else {
       r.failStreak++;
-      // The first failing mature window is a warning; `probationWindows` FURTHER
-      // consecutive failures are fatal (default 1 => fail twice in a row).
-      if (r.failStreak >= s.probationWindows + 1) {
+      // probationWindows = 0 is the literal zero-tolerance rule: the FIRST
+      // failing mature window is fatal, with no warning step. For n >= 1 the
+      // first failure is a warning and n FURTHER consecutive failures are fatal
+      // (default 1 => fail twice in a row). See the mapping in the file header.
+      const fatalStreak = s.probationWindows <= 0 ? 1 : s.probationWindows + 1;
+      if (r.failStreak >= fatalStreak) {
         verdict = 'TERMINATE';
-        reason = `net ${netMinor} below benchmark ${s.minNetMinor} for ${r.failStreak} consecutive mature window(s) (probationWindows=${s.probationWindows})`;
+        reason = `net ${netMinor} below benchmark ${s.minNetMinor} for ${r.failStreak} consecutive mature window(s), the fatal streak being ${fatalStreak} (probationWindows=${s.probationWindows})`;
       } else {
         verdict = 'PROBATION';
         reason = `net ${netMinor} below benchmark ${s.minNetMinor} in window ${w} (ticks ${from}-${to}); first failure, on probation`;

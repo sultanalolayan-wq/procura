@@ -175,3 +175,29 @@ test('non-integer numeric env vars are rejected rather than coerced', () => {
   assert.throws(() => loadConfig({ ARES_TICK_MS: '5000.5' }), ConfigError);
   assert.throws(() => loadConfig({ ARES_MAX_QUEUE: '1e3' }), ConfigError);
 });
+
+/* ------------------------------------------------- AMENDMENT A1: zero floors */
+
+test('the survival guards accept 0 so the literal zero-tolerance policy is reachable from the environment', () => {
+  const c = loadConfig({
+    ARES_GRACE_WINDOWS: '0',
+    ARES_MIN_SAMPLES: '0',
+    ARES_PROBATION_WINDOWS: '0',
+  });
+  assert.equal(c.survival.graceWindows, 0);
+  assert.equal(c.survival.minSamples, 0);
+  assert.equal(c.survival.probationWindows, 0);
+  // The other survival fields keep their defaults and their own validation.
+  assert.equal(c.survival.windowTicks, 20);
+  assert.equal(c.survival.minNetMinor, 0);
+});
+
+test('zero is the floor, not the absence of a floor: negatives are still refused', () => {
+  for (const key of ['ARES_GRACE_WINDOWS', 'ARES_MIN_SAMPLES', 'ARES_PROBATION_WINDOWS']) {
+    const err = caught(() => loadConfig({ [key]: '-1' }));
+    assert.match(err.message, new RegExp(key));
+    assert.match(err.message, /below the minimum of 0/);
+  }
+  // windowTicks is NOT one of the guards and still requires at least one tick.
+  assert.throws(() => loadConfig({ ARES_WINDOW_TICKS: '0' }), ConfigError);
+});
