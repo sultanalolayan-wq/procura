@@ -16,6 +16,10 @@ export interface AresConfig {
   tickIntervalMs: number;
   dataDir: string;
   logLevel: Level;
+  /** Ticks between state snapshots. 0 disables snapshots entirely. */
+  snapshotEveryTicks: number;
+  /** How many snapshot files to keep on disk. Older ones are deleted. */
+  snapshotRetain: number;
   api: { host: string; port: number; token: string | null };
   budget: {
     globalCashCapMinor: Minor;
@@ -48,6 +52,19 @@ export interface AresConfig {
 }
 
 export type Env = Record<string, string | undefined>;
+
+/**
+ * Shortest ARES_API_TOKEN the loader will accept. The token is the ONLY thing
+ * between a reachable socket and an irreversible halt; a one-character token
+ * was accepted before this floor existed.
+ */
+export const MIN_API_TOKEN_LENGTH = 32;
+
+/** Default ticks between snapshots (ARES_SNAPSHOT_EVERY). */
+export const DEFAULT_SNAPSHOT_EVERY_TICKS = 20;
+
+/** Default number of snapshot files retained on disk (ARES_SNAPSHOT_RETAIN). */
+export const DEFAULT_SNAPSHOT_RETAIN = 48;
 
 class Problems {
   readonly list: string[] = [];
@@ -115,8 +132,25 @@ export function loadConfig(env: Env = process.env): AresConfig {
   else logLevel = lvlRaw;
 
   const apiHost = raw(env, 'ARES_API_HOST') ?? '127.0.0.1';
-  const apiPort = intOf(env, 'ARES_API_PORT', 8787, p, { min: 1, max: 65535 });
+  // 0 is legal and means "ask the OS for an ephemeral port": tests and
+  // sidecar deployments need a port nobody else can predict or collide with.
+  // The bound port is reported back by ApiServer.start().
+  const apiPort = intOf(env, 'ARES_API_PORT', 8787, p, { min: 0, max: 65535 });
   const apiToken = raw(env, 'ARES_API_TOKEN') ?? null;
+  if (apiToken !== null && apiToken.length < MIN_API_TOKEN_LENGTH) {
+    p.add(
+      `ARES_API_TOKEN: a token of ${apiToken.length} character(s) is not a secret. ` +
+        `It gates the route that halts the swarm and it is accepted on a 0.0.0.0 bind, so at least ` +
+        `${MIN_API_TOKEN_LENGTH} characters are required (e.g. \`openssl rand -hex 32\`).`,
+    );
+  }
+
+  // Snapshots live on the SAME volume as the ledger, and under read_only:true
+  // that volume is the only writable path there is. An unbounded snapshot
+  // directory therefore fills the disk the audit trail depends on, so the
+  // retention count is configuration, not a constant.
+  const snapshotEveryTicks = intOf(env, 'ARES_SNAPSHOT_EVERY', DEFAULT_SNAPSHOT_EVERY_TICKS, p, { min: 0 });
+  const snapshotRetain = intOf(env, 'ARES_SNAPSHOT_RETAIN', DEFAULT_SNAPSHOT_RETAIN, p, { min: 1 });
 
   const budget = {
     globalCashCapMinor: intOf(env, 'ARES_CASH_CAP', 100_000, p, { min: 0 }),
@@ -190,6 +224,8 @@ export function loadConfig(env: Env = process.env): AresConfig {
     tickIntervalMs,
     dataDir,
     logLevel,
+    snapshotEveryTicks,
+    snapshotRetain,
     api: { host: apiHost, port: apiPort, token: apiToken },
     budget,
     survival,

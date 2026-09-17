@@ -136,6 +136,41 @@ test('checkChannel denies capabilities that are internally inconsistent', () => 
   assert.match(e.message, /terms of service/i);
 });
 
+test('checkChannel ADMITS a sell-only channel that records why it has no buy path', () => {
+  // The real ksa_ecom case. canBuy:false with buyRequiresHumanApproval:true is
+  // NOT an inconsistent capability set: it is an honest sell-only channel
+  // stating the reason it offers no automated purchasing. Denying the whole
+  // adapter for that is why the Saudi sell path, its SAR pricing and its VAT
+  // handling were unreachable in every default run.
+  const p = new PolicyEngine(cfgOf(), nullLogger);
+  p.checkChannel(
+    adapter('ksa_ecom', {
+      canBuy: false,
+      canSell: true,
+      buyRequiresHumanApproval: true,
+      tosNote: 'ToS: automated purchasing is assumed to be prohibited; selling needs an approved merchant account',
+    }),
+  );
+  const d = last(p);
+  assert.equal(d.allowed, true);
+  assert.equal(d.rule, RULES.CHANNEL_OK);
+  assert.match(d.reason, /SELL-ONLY/);
+  assert.equal(d.meta['sellOnly'], true);
+  assert.equal(d.meta['canBuy'], false);
+  assert.equal(d.meta['buyRequiresHumanApproval'], true);
+});
+
+test('the inconsistent-capability denial names the remedy', () => {
+  const p = new PolicyEngine(cfgOf(), nullLogger);
+  const e = denied(() =>
+    p.checkChannel(adapter('ksa_ecom', { canBuy: true, canSell: true, buyRequiresHumanApproval: true })),
+  );
+  assert.equal(e.meta?.['rule'], RULES.CHANNEL_APPROVAL);
+  // An operator reading only this message must learn what to do about it.
+  assert.match(e.message, /canBuy:false/);
+  assert.match(e.message, /SELL-ONLY/i);
+});
+
 test('checkChannel accepts an approval-requiring channel when an approval channel exists', () => {
   const p = new PolicyEngine(cfgOf(), nullLogger, { approvalChannel: 'ops-inbox' });
   p.checkChannel(adapter('ksa_ecom', { canBuy: true, buyRequiresHumanApproval: true }));

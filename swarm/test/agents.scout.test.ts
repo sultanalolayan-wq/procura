@@ -95,7 +95,7 @@ test('the scout refuses a low-confidence, high-apparent-margin opportunity', asy
 
 /* ---------------------------------------------------- the ToS-refusing channel */
 
-test('the scout never calls ksa_ecom.buy(): policy denies it first', async () => {
+test('the scout never calls ksa_ecom.buy(), whatever the channel declares', async () => {
   const s = await makeStack({}, { channels: ['ksa_ecom'], seed: 9 });
   try {
     const ke = s.channels.get('ksa_ecom');
@@ -108,22 +108,49 @@ test('the scout never calls ksa_ecom.buy(): policy denies it first', async () =>
       return original(...args);
     };
 
-    // A completely unfiltered arm: nothing but policy can stop this scout.
+    // A completely unfiltered arm: nothing but the gates can stop this scout.
     const scout = new ScoutAgent('scout-ksa', 'edge-hunter', s.depsFor('scout-ksa'), { arms: [LOOSE] });
     for (let t = 0; t < 12; t++) await scout.runTick(t);
     await s.bus.drain();
 
     assert.equal(buyAttempts, 0, 'ksa_ecom.buy() was never entered');
     assert.equal(s.ledger.entries({ type: 'BUY' }).length, 0);
+    assert.equal(scout.crashes, 0, 'a refusal is not a crash');
+  } finally {
+    s.close();
+  }
+});
+
+test('policy denies a human-approval channel BEFORE the adapter buy path is reached', async () => {
+  // The gate itself, pinned on a stub rather than on ksa_ecom's own capability
+  // declaration: whether that adapter advertises canBuy is its business, but the
+  // policy rule that stops an autonomous purchase on a human-approval channel
+  // must fire before adapter.buy() under every configuration.
+  const stub = new StubAdapter({
+    name: 'digitalassets',
+    quoteFeeMinor: 0,
+    capabilities: { canBuy: true, buyRequiresHumanApproval: true, tosNote: 'a human must approve every purchase' },
+  });
+  stub.opportunities = [
+    stub.opportunity({ askPrice: money(1_000, 'SAR'), estResaleValue: money(3_000, 'SAR'), confidence: 0.99 }),
+  ];
+  const s = await makeStack({}, { channels: [], extraChannels: new Map([['digitalassets', stub]]) });
+  try {
+    const scout = new ScoutAgent('scout-approval', 'edge-hunter', s.depsFor('scout-approval'), { arms: [LOOSE] });
+    for (let t = 0; t < 6; t++) await scout.runTick(t);
+    await s.bus.drain();
+
+    assert.equal(stub.calls['buy'], 0, 'the adapter buy path was never entered');
+    assert.equal(s.ledger.entries({ type: 'BUY' }).length, 0);
     assert.equal(scout.crashes, 0, 'a policy refusal is not a crash');
 
     const denials = s.policy.decisions().filter((d) => !d.allowed);
     assert.ok(denials.length >= 1, 'policy recorded the refusal');
     assert.equal(denials[0]?.rule, 'buy.human_approval');
-    assert.match(String(denials[0]?.reason), /terms of service/i);
-    assert.deepEqual(scout.stats().policyBlocked, ['ksa_ecom']);
+    assert.match(String(denials[0]?.reason), /human to approve/i);
+    assert.deepEqual(scout.stats().policyBlocked, ['digitalassets']);
 
-    const emitted = s.of('POLICY_DENIED').filter((e) => e.from === 'scout-ksa');
+    const emitted = s.of('POLICY_DENIED').filter((e) => e.from === 'scout-approval');
     assert.equal(emitted.length, 1, 'denied once, then the channel is remembered as blocked');
     assert.equal((emitted[0]?.payload as { stage: string }).stage, 'buy');
   } finally {
@@ -169,22 +196,34 @@ test('a purchase reserves, books a balanced entry and hands the holding on', asy
     const buys = s.ledger.entries({ type: 'BUY' });
     assert.equal(buys.length, 1);
     const legs = buys[0]!.legs;
+    // AMENDMENT A7 — this expectation was changed deliberately. The commission
+    // used to be expensed to `fees`, which left the holding carried at the bare
+    // ask and let the seller's floor certify a round trip that loses exactly the
+    // commission. It is CAPITALISED now: one unit at 1,000 + 40 is carried at
+    // 1,040, and there is no fee leg because nothing was left over.
     assert.deepEqual(
       legs.map((l) => [l.account, l.amount]),
       [
-        ['inventory', 1_000],
-        ['fees', 40],
+        ['inventory', 1_040],
         ['cash', -1_040],
       ],
     );
     assert.equal(legs.reduce((a, l) => a + l.amount, 0), 0);
     assert.equal(buys[0]!.meta['arm'], 'only');
+    assert.equal(buys[0]!.meta['askUnitCostMinor'], 1_000, 'the ask is still recorded, for audit');
+    assert.equal(buys[0]!.meta['buyFeeMinor'], 40);
+    assert.equal(buys[0]!.meta['unitCostMinor'], 1_040, 'and the all-in basis is what is carried');
     assert.ok(String(buys[0]!.idempotencyKey).length > 0);
 
     assert.equal(s.budget.openReservations('scout-buy').length, 0, 'the reservation was committed');
     const added = s.of('INVENTORY_ADDED');
     assert.equal(added.length, 1);
     assert.equal((added[0]?.payload as { costMinor: number }).costMinor, 1_040);
+    // The seller downstream must see the all-in unit cost, not the ask.
+    const handed = (added[0]?.payload as { holding: { unitCost: { amount: number } } }).holding;
+    assert.equal(handed.unitCost.amount, 1_040, 'the holding carries the commission');
+    assert.equal((added[0]?.payload as { unitCostMinor: number }).unitCostMinor, 1_040);
+    assert.equal(s.ledger.balanceOf('inventory'), 1_040, 'inventory == qty * unitCost, exactly');
     assert.equal(scout.trades().length, 1);
     assert.equal(scout.trades()[0]?.costMinor, 1_040);
     assert.equal(s.ledger.verify().ok, true);
@@ -372,6 +411,99 @@ test('the scout survives an adapter that throws and opens its circuit', async ()
     assert.ok(stub.calls['buy']! <= 2, 'the circuit stopped hammering a dead channel');
     const results = s.of('BUY_RESULT').filter((e: Envelope) => (e.payload as { ok: boolean }).ok === false);
     assert.ok(results.length >= 1);
+  } finally {
+    s.close();
+  }
+});
+
+/* ===================== AMENDMENT A6: the reservation must never leak ======== */
+
+test('A6: a ledger fault between reserve() and commit() still gives the cash back', async () => {
+  const stub = new StubAdapter({ name: 'digitalassets', quoteFeeMinor: 0 });
+  stub.opportunities = [
+    stub.opportunity({ askPrice: money(1_000, 'SAR'), estResaleValue: money(3_000, 'SAR'), confidence: 0.99 }),
+  ];
+  const s = await makeStack({}, { channels: [], extraChannels: new Map([['digitalassets', stub]]) });
+  try {
+    const scout = new ScoutAgent('scout-leak', 'edge-hunter', s.depsFor('scout-leak'), { arms: [LOOSE] });
+    const availableBefore = s.budget.availableCash('scout-leak');
+
+    // The failure mode the old code had no finally for: the adapter said yes,
+    // the money is promised, and THEN the disk says no.
+    const realAppend = s.ledger.append.bind(s.ledger);
+    let faults = 0;
+    (s.ledger as unknown as { append: typeof s.ledger.append }).append = ((e: Parameters<typeof s.ledger.append>[0]) => {
+      if (e.type === 'BUY') {
+        faults++;
+        throw new Error('ENOSPC: no space left on device');
+      }
+      return realAppend(e);
+    }) as typeof s.ledger.append;
+
+    await scout.runTick(1);
+    await s.bus.drain();
+
+    assert.ok(faults >= 1, 'the ledger really did fault mid-buy');
+    assert.equal(s.ledger.entries({ type: 'BUY' }).length, 0, 'and nothing was booked');
+    assert.deepEqual(s.budget.openReservations('scout-leak'), [], 'openReservations drained to empty');
+    assert.deepEqual(scout.outstandingReservations(), []);
+    assert.equal(
+      s.budget.availableCash('scout-leak'),
+      availableBefore,
+      'the headroom is exactly what it was: nothing is still promised',
+    );
+    assert.ok(scout.crashes >= 1, 'the fault was counted, not swallowed');
+
+    // And the swarm keeps working once the disk comes back.
+    (s.ledger as unknown as { append: typeof s.ledger.append }).append = realAppend;
+    await scout.runTick(2);
+    await s.bus.drain();
+    assert.equal(s.ledger.entries({ type: 'BUY' }).length, 1);
+    assert.deepEqual(s.budget.openReservations('scout-leak'), []);
+  } finally {
+    s.close();
+  }
+});
+
+/* ============== AMENDMENT A7: the commission is part of the unit cost ======= */
+
+test('A7: an indivisible commission remainder is expensed, and the books stay in lockstep', async () => {
+  // 3 units at 1,000 with a 40 commission: 3,040 does not divide into three
+  // whole minor units, so the unit cost is 1,013 and the 1 that is left over is
+  // the only thing that reaches `fees`.
+  const stub = new StubAdapter({ name: 'digitalassets', quoteFeeMinor: 40 });
+  stub.opportunities = [
+    stub.opportunity({ askPrice: money(1_000, 'SAR'), estResaleValue: money(4_000, 'SAR'), confidence: 0.99 }),
+  ];
+  const s = await makeStack({}, { channels: [], extraChannels: new Map([['digitalassets', stub]]) });
+  try {
+    const THREE: ScoutArm = { id: 'only', minMarginRatio: 0.0, minConfidence: 0.0, qty: 3 };
+    const scout = new ScoutAgent('scout-split', 'edge-hunter', s.depsFor('scout-split'), { arms: [THREE] });
+    await scout.runTick(1);
+    await s.bus.drain();
+
+    const buy = s.ledger.entries({ type: 'BUY' })[0];
+    assert.ok(buy);
+    assert.deepEqual(
+      buy.legs.map((l) => [l.account, l.amount]),
+      [
+        ['inventory', 3_039],
+        ['fees', 1],
+        ['cash', -3_040],
+      ],
+    );
+    assert.equal(buy.legs.reduce((a, l) => a + l.amount, 0), 0, 'still a balanced double entry');
+    assert.equal(buy.meta['unitCostMinor'], 1_013);
+
+    const handed = (s.of('INVENTORY_ADDED')[0]?.payload as { holding: { unitCost: { amount: number }; qty: number } })
+      .holding;
+    assert.equal(handed.unitCost.amount, 1_013);
+    assert.equal(
+      handed.unitCost.amount * handed.qty,
+      s.ledger.balanceOf('inventory'),
+      'qty * unitCost equals the inventory account to the halala',
+    );
+    assert.equal(s.ledger.verify().ok, true);
   } finally {
     s.close();
   }

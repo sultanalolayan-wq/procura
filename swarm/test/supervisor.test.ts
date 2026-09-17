@@ -35,7 +35,14 @@ class FakeAgent extends BaseAgent {
 
 function makeSupervisor(
   s: Stack,
-  opts: { snapshotEveryTicks?: number; maxTicks?: number; onShutdown?: () => Promise<void>; exit?: (c: number) => void } = {},
+  opts: {
+    snapshotEveryTicks?: number;
+    snapshotRetain?: number;
+    maxTicks?: number;
+    onShutdown?: () => Promise<void>;
+    exit?: (c: number) => void;
+    fsync?: (fd: number) => void;
+  } = {},
 ): Supervisor {
   return new Supervisor(
     {
@@ -50,9 +57,11 @@ function makeSupervisor(
       memories: () => [s.taskMemory, ...s.memories.values()],
       ...(opts.onShutdown ? { onShutdown: opts.onShutdown } : {}),
       ...(opts.exit ? { exit: opts.exit } : {}),
+      ...(opts.fsync ? { fsync: opts.fsync } : {}),
     },
     {
       snapshotEveryTicks: opts.snapshotEveryTicks ?? 0,
+      ...(opts.snapshotRetain !== undefined ? { snapshotRetain: opts.snapshotRetain } : {}),
       ...(opts.maxTicks !== undefined ? { maxTicks: opts.maxTicks } : {}),
     },
   );
@@ -427,6 +436,187 @@ test('an agent whose runTick somehow throws does not take the loop down', async 
     await sup.runTick(0);
     assert.deepEqual(after.calls, [0], 'the seller phase still ran');
     assert.equal(sup.snapshot().ticksExecuted, 1);
+  } finally {
+    s.close();
+  }
+});
+
+/* ===================================================================== */
+/* FIX B1c — the tick watchdog must not be trippable from outside         */
+/* ===================================================================== */
+
+test('FIX B1c: event-loop time stolen by an HTTP handler is NOT charged to the tick watchdog', async () => {
+  const s = await makeStack({ ARES_TICK_MS: '1000', ARES_TICK_WATCHDOG_MS: '50' });
+  try {
+    const sup = makeSupervisor(s);
+    // Exactly the attack: five concurrent unauthenticated GETs per tick, each
+    // blocking the shared event loop, for three ticks. None of it is the
+    // swarm's own work, and none of it may reach the emergency stop.
+    const handler = new FakeAgent('scout-1', 'scout', s.depsFor('scout-1'), () => {
+      s.clock.advance(400);
+      sup.noteExternalBlocking(400);
+    });
+    s.registry.register(handler);
+
+    for (let t = 0; t < 5; t++) await sup.runTick(t);
+
+    assert.equal(s.killSwitch.tripped, false, 'a stranger with no credential must not be able to halt the swarm');
+    const snap = sup.snapshot();
+    assert.equal(snap.overruns, 0, 'nothing overran: none of that time was the tick doing work');
+    assert.equal(snap.consecutiveOverruns, 0);
+    assert.equal(snap.lastTickMs, 0, 'measured work is zero');
+    assert.equal(snap.lastTickWallMs, 400, 'wall time is still reported honestly');
+    assert.equal(snap.lastExternalBlockedMs, 400, '...and attributed to whoever declared it');
+    assert.equal(sup.externalBlockedMs, 2_000);
+  } finally {
+    s.close();
+  }
+});
+
+test('FIX B1c: the swarm’s OWN slowness still trips the watchdog exactly as before', async () => {
+  const s = await makeStack({ ARES_TICK_MS: '1000', ARES_TICK_WATCHDOG_MS: '50' });
+  try {
+    const sup = makeSupervisor(s);
+    // Same 120ms per tick as the original watchdog test, but here it is the
+    // agent's own work and nobody declares it as external.
+    const slow = new FakeAgent('scout-1', 'scout', s.depsFor('scout-1'), () => {
+      s.clock.advance(120);
+    });
+    s.registry.register(slow);
+    await sup.runTick(0);
+    await sup.runTick(1);
+    assert.equal(s.killSwitch.tripped, false);
+    await sup.runTick(2);
+    assert.equal(s.killSwitch.tripped, true, 'the watchdog must still protect against a genuinely slow loop');
+    assert.equal(sup.snapshot().lastExternalBlockedMs, 0);
+  } finally {
+    s.close();
+  }
+});
+
+test('FIX B1c: a bogus external-blocking claim can only ever make the watchdog more forgiving', async () => {
+  const s = await makeStack({ ARES_TICK_MS: '1000', ARES_TICK_WATCHDOG_MS: '50' });
+  try {
+    const sup = makeSupervisor(s);
+    for (const bad of [-5_000, NaN, Infinity, 0]) sup.noteExternalBlocking(bad);
+    assert.equal(sup.externalBlockedMs, 0, 'nonsense is ignored, never subtracted as negative work');
+    const slow = new FakeAgent('scout-1', 'scout', s.depsFor('scout-1'), () => {
+      s.clock.advance(120);
+      sup.noteExternalBlocking(-1_000);
+    });
+    s.registry.register(slow);
+    await sup.runTick(0);
+    assert.equal(sup.snapshot().overruns, 1, 'a negative claim cannot manufacture an overrun either way');
+  } finally {
+    s.close();
+  }
+});
+
+/* ===================================================================== */
+/* FIX B6 — a crashed loop must be visible to every liveness signal       */
+/* ===================================================================== */
+
+test('FIX B6: a crashed loop stops claiming to run and latches the kill switch', async () => {
+  const s = await makeStack({ ARES_TICK_MS: '1000' });
+  try {
+    const sup = makeSupervisor(s);
+    // Break the loop below runTick's own error handling, the way a bug in the
+    // registry (or anything else the loop touches) would.
+    (s.registry as unknown as { activeByRole: () => never }).activeByRole = () => {
+      throw new Error('the loop itself fell over');
+    };
+
+    sup.start();
+    await settle();
+
+    const snap = sup.snapshot();
+    assert.equal(snap.loopCrashed, true);
+    assert.equal(snap.running, false, 'running=true over a dead loop is what kept /readyz and /healthz green');
+    assert.equal(sup.isRunning, false);
+    assert.equal(s.killSwitch.tripped, true, 'the swarm is dead; every gate must agree');
+    assert.match(String(s.killSwitch.reason), /loop crashed/i);
+    assert.equal(snap.stalled, true, 'and /readyz reads this');
+  } finally {
+    s.clock.releaseAll();
+    s.close();
+  }
+});
+
+test('FIX B6: a loop that has missed its deadline by more than one interval reports as stalled', async () => {
+  const s = await makeStack({ ARES_TICK_MS: '1000', ARES_TICK_WATCHDOG_MS: '1000000' });
+  try {
+    const seenStalled: boolean[] = [];
+    let sup!: Supervisor;
+    const a = new FakeAgent('scout-1', 'scout', s.depsFor('scout-1'), () => {
+      seenStalled.push(sup.snapshot().stalled); // on time so far
+      s.clock.advance(3_000); // now three whole intervals late
+      seenStalled.push(sup.snapshot().stalled);
+    });
+    s.registry.register(a);
+    sup = makeSupervisor(s, { maxTicks: 1 });
+
+    sup.start();
+    await settle();
+    await sup.done();
+
+    assert.deepEqual(seenStalled, [false, true], 'not stalled at the deadline, stalled three intervals past it');
+    assert.ok(sup.snapshot().tickOverdueMs >= 0);
+    await sup.stop('test over');
+    assert.equal(sup.snapshot().stalled, false, 'a supervisor that has stopped is not "stalled", it is stopped');
+  } finally {
+    s.clock.releaseAll();
+    s.close();
+  }
+});
+
+/* ===================================================================== */
+/* FIX B7 — snapshots are pruned and durably written                     */
+/* ===================================================================== */
+
+test('FIX B7: only the newest N snapshots are kept, so the ledger volume cannot be filled', async () => {
+  const s = await makeStack({ ARES_TICK_MS: '1000' });
+  try {
+    const a = new FakeAgent('scout-1', 'scout', s.depsFor('scout-1'), () => undefined);
+    s.registry.register(a);
+    const sup = makeSupervisor(s, { snapshotEveryTicks: 1, snapshotRetain: 3 });
+
+    for (let t = 0; t < 7; t++) await sup.runTick(t);
+
+    const dir = join(s.dir, 'snapshots');
+    const files = readdirSync(dir).filter((f) => f.endsWith('.json')).sort();
+    assert.equal(files.length, 3, 'nothing used to delete these: ~864 files/day, ~315k/year');
+    assert.deepEqual(files, [
+      'tick-00000004.json',
+      'tick-00000005.json',
+      'tick-00000006.json',
+    ], 'and it is the OLDEST that go');
+    assert.equal(sup.snapshot().snapshots, 7);
+    assert.equal(sup.snapshot().snapshotsPruned, 4);
+    assert.equal(sup.snapshot().snapshotRetain, 3);
+    assert.equal(readdirSync(dir).some((f) => f.endsWith('.tmp')), false);
+  } finally {
+    s.close();
+  }
+});
+
+test('FIX B7: the snapshot is fsync’d before the rename, like MemoryStore.flush', async () => {
+  const s = await makeStack({ ARES_TICK_MS: '1000' });
+  try {
+    const synced: number[] = [];
+    const sup = makeSupervisor(s, {
+      snapshotEveryTicks: 1,
+      fsync: (fd) => {
+        synced.push(fd);
+      },
+    });
+    const file = sup.writeSnapshot(0);
+    assert.ok(file);
+    assert.equal(existsSync(file), true);
+    assert.ok(synced.length >= 1, 'the comment promised a durability guarantee the code did not provide');
+    // The file is complete and parseable after the rename.
+    const body = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+    assert.equal(body['tick'], 0);
+    assert.equal(existsSync(`${file}.tmp`), false);
   } finally {
     s.close();
   }

@@ -1,11 +1,36 @@
 /**
  * agents/base.ts — the shared body of every agent: the action budget, the halt
  * gate, crash containment, the learning hook and an idempotent terminate().
+ * THE COMPUTE CHARGE (amendment A9). act() charges a MODELLED per-action compute
+ * cost to the budget governor. Be honest about what that number is: these agents
+ * are deterministic heuristics with no LLM behind them, so nothing here MEASURES
+ * token usage — ACTION_TOKENS is an estimate of what an action of this shape
+ * would cost if it were served by a model, priced through ARES_TOKEN_PRICE. It
+ * is a modelled operating cost, not a meter reading. It exists because with zero
+ * compute charged, balanceOf('compute') was permanently 0, ARES_TOKEN_CAP /
+ * ARES_AGENT_TOKEN_CAP / ARES_TOKEN_PRICE were inert brakes that .env.example
+ * advertised as live, and — worst of all — ANY gross trading margin read as
+ * profit, so the survival rule could never see the cost of running the swarm.
+ * The caps are load-bearing now: an agent that has exhausted its token cap is
+ * refused its next action, exactly as it is refused a cash reservation.
+ *
+ * It is ACCRUED per action and BOOKED once per tick. Every action is charged and
+ * the cap is enforced at the moment of the action — the accrual is subtracted
+ * from the headroom before the next one is allowed — but the ledger gets ONE
+ * TOKEN_SPEND entry per agent per tick instead of one per action. A ledger entry
+ * is ~640 bytes and the chain is re-hashed in full every tick, so writing one per
+ * action to record a few halalas would have made compute charges ~96% of all
+ * ledger entries (measured: 1,108 of 1,150 over a 200-tick run) and multiplied
+ * the growth rate of a file that has no rotation. The books are never more than
+ * one tick stale, and an agent that dies mid-tick settles in terminate().
+ *
  * Invariants: act() consults the kill switch BEFORE anything else and NEVER lets
  * an exception escape into the supervisor; the action cap is per agent per tick;
- * terminate() releases every reservation, liquidates paper inventory and writes a
- * postmortem, and is safe to call twice; an AgentDeps whose PolicyEngine has no
- * kill switch is REFUSED at construction (see assertPolicyWired below).
+ * the compute charge happens after both gates and before the work, so a refused
+ * action is never charged; terminate() releases every reservation, liquidates
+ * paper inventory and writes a postmortem, and is safe to call twice; an
+ * AgentDeps whose PolicyEngine has no kill switch is REFUSED at construction
+ * (see assertPolicyWired below).
  * Callers: scout/seller/treasury, registry, runtime/supervisor.
  */
 
@@ -43,7 +68,20 @@ export interface AgentDeps {
   rng: Rng;
   logger: Logger;
   channels: Map<string, ChannelAdapter>;
+  /**
+   * Modelled tokens charged per act(). Optional; defaults to ACTION_TOKENS.
+   * 0 disables the charge entirely, which is a deliberate, auditable choice and
+   * not the default — see the compute-charge note in the file header.
+   */
+  tokensPerAction?: number;
 }
+
+/**
+ * The modelled token cost of one agent action. At the default ARES_TOKEN_PRICE
+ * of 1875 minor units per million tokens this is 2 minor units (rounded up) per
+ * action — small, deliberately conservative, and above all NOT zero.
+ */
+export const ACTION_TOKENS = 1_000;
 
 export interface AgentSnapshot {
   id: AgentId;
@@ -57,6 +95,10 @@ export interface AgentSnapshot {
   actionsRefused: number;
   crashes: number;
   haltRefusals: number;
+  /** Actions refused because the agent had no token headroom left. */
+  tokenRefusals: number;
+  /** Modelled tokens charged to the compute account so far. */
+  tokensCharged: number;
   lastError: string | null;
   openReservations: number;
   holdings: number;
@@ -154,8 +196,14 @@ export abstract class BaseAgent {
   private actionsRefused = 0;
   private crashCount = 0;
   private haltRefusals = 0;
+  private tokenRefusals = 0;
+  private tokensCharged = 0;
+  /** Modelled tokens taken this tick but not yet written to the ledger. */
+  private tokensPending = 0;
+  private tokensPendingTick = -1;
   private lastErrorMsg: string | null = null;
   private terminatedFlag = false;
+  private readonly tokensPerAction: number;
 
   constructor(id: AgentId, role: AgentRole, strategyId: string, deps: AgentDeps) {
     if (typeof id !== 'string' || id.length === 0) {
@@ -173,6 +221,8 @@ export abstract class BaseAgent {
     this.deps = deps;
     this.cfg = deps.cfg;
     this.log = deps.logger.child({ agentId: id, role, strategyId });
+    const t = deps.tokensPerAction;
+    this.tokensPerAction = Number.isSafeInteger(t) && (t as number) >= 0 ? (t as number) : ACTION_TOKENS;
     if (!deps.budget.has(id)) deps.budget.register(id);
   }
 
@@ -203,6 +253,33 @@ export abstract class BaseAgent {
     } catch (err) {
       this.noteCrash('onTick', err);
       return false;
+    } finally {
+      // Whatever the tick did, what it consumed is booked before it ends.
+      this.settleCompute();
+    }
+  }
+
+  /**
+   * Write this tick's accrued compute to the ledger as ONE entry. Safe to call
+   * when nothing is pending; safe to call twice.
+   */
+  protected settleCompute(): void {
+    const tokens = this.tokensPending;
+    const tick = this.tokensPendingTick;
+    if (tokens <= 0 || tick < 0) {
+      this.tokensPending = 0;
+      return;
+    }
+    this.tokensPending = 0;
+    try {
+      this.deps.budget.chargeTokens(this.id, tokens, tick);
+      this.tokensCharged += tokens;
+    } catch (err) {
+      this.log.error('agent.token_settle_failed', {
+        tick,
+        tokens,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -253,6 +330,31 @@ export abstract class BaseAgent {
       this.actionsRefused++;
       this.log.warn('agent.action_cap_reached', { action: name, tick: this.tickNo, cap });
       return null;
+    }
+    // 3. THE COMPUTE CHARGE. An action costs something to run; accruing it here
+    //    is what makes balanceOf('compute') real and the token caps load-bearing.
+    //    The pending accrual is subtracted from the headroom, so the cap is
+    //    enforced at the moment of the action even though the ledger entry for
+    //    the whole tick is written once, at the end of it.
+    if (this.tokensPerAction > 0) {
+      const tick = this.tickNo < 0 ? 0 : this.tickNo;
+      if (tick !== this.tokensPendingTick) {
+        this.settleCompute();
+        this.tokensPendingTick = tick;
+      }
+      const free = this.deps.budget.availableTokens(this.id) - this.tokensPending;
+      if (free < this.tokensPerAction) {
+        this.tokenRefusals++;
+        this.log.warn('agent.token_cap_reached', {
+          action: name,
+          tick: this.tickNo,
+          need: this.tokensPerAction,
+          free,
+          pending: this.tokensPending,
+        });
+        return null;
+      }
+      this.tokensPending += this.tokensPerAction;
     }
     this.actionsThisTick++;
     this.actionsTaken++;
@@ -406,6 +508,8 @@ export abstract class BaseAgent {
     }
     this.terminatedFlag = true;
     this.status = 'terminated';
+    // An agent that dies mid-tick still consumed what it consumed.
+    this.settleCompute();
     const why = typeof reason === 'string' && reason.length > 0 ? reason : 'unspecified';
     const tick = this.tickNo < 0 ? 0 : this.tickNo;
 
@@ -468,6 +572,8 @@ export abstract class BaseAgent {
       actionsTaken: this.actionsTaken,
       actionsRefused: this.actionsRefused,
       haltRefusals: this.haltRefusals,
+      tokenRefusals: this.tokenRefusals,
+      tokensCharged: this.tokensCharged,
       reservationsReleased: released.length,
       writtenOffMinor,
       netMeanMinor: netStat ? netStat.mean : null,
@@ -512,6 +618,17 @@ export abstract class BaseAgent {
   }
 
   /**
+   * Live operational state a successor must take over. The registry reads this
+   * BEFORE terminate() runs and writes it into the successor's memory, so an
+   * obligation that is still live on a channel — a published listing that can
+   * still fill, above all — does not die with the agent that created it.
+   * Default: nothing to hand over.
+   */
+  handoverState(): Record<string, unknown> {
+    return {};
+  }
+
+  /**
    * The most recent postmortem this agent wrote, or null. The registry reads it
    * when it spawns a replacement so the successor inherits the lesson.
    */
@@ -538,6 +655,8 @@ export abstract class BaseAgent {
       actionsRefused: this.actionsRefused,
       crashes: this.crashCount,
       haltRefusals: this.haltRefusals,
+      tokenRefusals: this.tokenRefusals,
+      tokensCharged: this.tokensCharged,
       lastError: this.lastErrorMsg,
       openReservations: this.openRes.size,
       holdings: this.inventory.size,

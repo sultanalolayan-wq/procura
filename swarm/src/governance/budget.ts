@@ -2,9 +2,19 @@
  * governance/budget.ts — the reservation protocol that stops two agents from
  * spending the same riyal in the same tick.
  * Invariants: reserve() fails CLOSED (every refusal is a BudgetDenied with a
- * distinct reason code); OUTSTANDING reservations reduce availability exactly
- * like spent money; a reservation settles at most once; committing more than
- * was reserved is impossible; token cost is integer minor units, rounded UP.
+ * distinct reason code, and every code is REACHABLE — see BUDGET_INSUFFICIENT_
+ * TOKENS below); OUTSTANDING reservations reduce availability exactly like spent
+ * money; a reservation settles at most once; committing more than was reserved
+ * is impossible; token cost is integer minor units, rounded UP.
+ *
+ * BUDGET_INSUFFICIENT_TOKENS (amendment A9). This code used to be dead: the
+ * branch that raised it tested `amount > globalTokenCap - globalUsed`, which the
+ * GLOBAL_CAP branch immediately above had already rejected, so the file promised
+ * a distinct reason code per refusal and then shipped one that could never fire.
+ * It now guards the constraint the cap check cannot see: token spend is PAID IN
+ * CASH (writeTokenCost debits compute and credits cash), so the swarm can run
+ * out of money to pay for compute long before it runs out of token allowance.
+ * That is a genuinely different refusal and it deserves its own code.
  * Callers: agents (via AgentDeps), treasury (reallocate/drawdown), api.
  */
 
@@ -331,14 +341,25 @@ export class BudgetGovernor {
         tick,
       });
     }
-    const free = b.globalTokenCap - globalUsed;
-    if (amount > free) {
-      throw this.deny(BudgetDeny.INSUFFICIENT_TOKENS, `reserve refused: ${amount} tokens exceed unreserved tokens ${free}`, {
-        agentId: row.agentId,
-        amount,
-        free,
-        tick,
-      });
+    // Tokens are bought with cash. A cap says what the operator ALLOWS; this
+    // says what the till can actually pay for, which is a different question and
+    // the only one that can still refuse after both caps have said yes.
+    const costMinor = tokenCostMinor(amount, b.tokenPriceMinorPerMTok);
+    const freeCash = this.cashOnHand() - this.outstandingFor(null, 'cash');
+    if (costMinor > freeCash) {
+      throw this.deny(
+        BudgetDeny.INSUFFICIENT_TOKENS,
+        `reserve refused: ${amount} tokens cost ${costMinor} minor units, which exceeds unreserved cash ${freeCash}`,
+        {
+          agentId: row.agentId,
+          amount,
+          costMinor,
+          freeCash,
+          onHand: this.cashOnHand(),
+          outstanding: this.outstandingFor(null, 'cash'),
+          tick,
+        },
+      );
     }
   }
 

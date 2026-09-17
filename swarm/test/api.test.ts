@@ -16,10 +16,19 @@ import { TestClock } from '../src/core/clock.js';
 import { loadConfig, type AresConfig, type Env } from '../src/core/config.js';
 import { AresError } from '../src/core/errors.js';
 import { nullLogger } from '../src/core/logger.js';
-import { ApiServer, assertBindable, isLoopbackHost, tokenMatches, LEDGER_LIMIT_MAX } from '../src/api/server.js';
+import {
+  ApiServer,
+  assertBindable,
+  isLoopbackHost,
+  tokenMatches,
+  LEDGER_LIMIT_MAX,
+  AUTH_LOCKOUT_AFTER,
+  AUTH_LOCKOUT_MS,
+} from '../src/api/server.js';
 import { bootstrap, type Ares } from '../src/runtime/orchestrator.js';
 
-const TOKEN = 'operator-token-9f3b2c7d5e1a4806';
+const TOKEN = 'operator-token-9f3b2c7d5e1a4806d2';
+const AUTH = { authorization: `Bearer ${TOKEN}` };
 
 interface Harness {
   ares: Ares;
@@ -32,10 +41,16 @@ interface Harness {
 /** Boot a real swarm with the API on an ephemeral port. */
 async function harness(env: Env = {}, ticks = 3): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'ares-api-'));
-  const loaded = loadConfig({ ARES_DATA_DIR: dir, ARES_TICK_MS: '1000', ARES_WINDOW_TICKS: '5', ...env });
-  // ARES_API_PORT cannot be 0 in the config (its minimum is 1), so the
-  // ephemeral port is patched in here.
-  const cfg: AresConfig = { ...loaded, api: { ...loaded.api, port: 0 } };
+  // Port 0 is a first-class configuration value now (ephemeral, assigned by the
+  // OS), so the test asks for it through the environment like any operator
+  // would instead of patching the frozen config afterwards.
+  const cfg = loadConfig({
+    ARES_DATA_DIR: dir,
+    ARES_TICK_MS: '1000',
+    ARES_WINDOW_TICKS: '5',
+    ARES_API_PORT: '0',
+    ...env,
+  });
   const clock = new TestClock(1_000);
   const ares = await bootstrap(cfg, { clock, logger: nullLogger });
   for (let t = 0; t < ticks; t++) {
@@ -338,14 +353,22 @@ test('no response body leaks the token, a file path or a stack frame', async () 
       '/dashboard.js',
     ];
     for (const p of paths) {
-      const res = await fetch(`${h.base}${p}`);
+      const res = await fetch(`${h.base}${p}`, { headers: AUTH });
       const text = await res.text();
       assert.equal(text.includes(TOKEN), false, `${p} leaked the operator token`);
       assert.equal(/\bat [\w.<>]+ \(/.test(text), false, `${p} leaked a stack frame`);
       assert.equal(text.includes(h.dir), false, `${p} leaked the data directory path`);
       assert.equal(/\/(home|root|Users)\//.test(text), false, `${p} leaked a filesystem path`);
     }
-    // The unauthorised answer leaks nothing either.
+    // The unauthorised answers leak nothing either — and there are more of
+    // them now, because a configured token gates every /api/* route.
+    for (const p of paths) {
+      const res = await fetch(`${h.base}${p}`);
+      const text = await res.text();
+      assert.equal(text.includes(TOKEN), false, `${p} leaked the operator token unauthenticated`);
+      assert.equal(text.includes(h.dir), false, `${p} leaked the data directory path unauthenticated`);
+      assert.equal(/\/(home|root|Users)\//.test(text), false, `${p} leaked a filesystem path unauthenticated`);
+    }
     const unauth = await fetch(`${h.base}/api/halt`, { method: 'POST' });
     const t = await unauth.text();
     assert.equal(t.includes(TOKEN), false);
@@ -359,7 +382,7 @@ test('no response body leaks the token, a file path or a stack frame', async () 
 test('/metrics parses as valid Prometheus text exposition format', async () => {
   const h = await harness({ ARES_API_TOKEN: TOKEN });
   try {
-    const res = await fetch(`${h.base}/metrics`);
+    const res = await fetch(`${h.base}/metrics`, { headers: AUTH });
     assert.equal(res.status, 200);
     assert.match(res.headers.get('content-type') ?? '', /text\/plain/);
     const text = await res.text();
@@ -501,5 +524,270 @@ test('the server refuses to bind an open host without a token, and stop() is ide
     await h.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ===================================================================== */
+/* FIX B2 — a configured token gates EVERY read route, not just halt      */
+/* ===================================================================== */
+
+const GATED = ['/api/state', '/api/agents', '/api/ledger', '/api/report', '/api/policy', '/metrics'];
+
+test('FIX B2: with a token configured, every /api/* route and /metrics require the bearer', async () => {
+  const h = await harness({ ARES_API_TOKEN: TOKEN });
+  try {
+    for (const p of GATED) {
+      const none = await getJson(`${h.base}${p}`);
+      assert.equal(none.status, 401, `${p} answered 200 with NO credential — the documented escape hatch was false`);
+      assert.equal(none.res.headers.get('www-authenticate'), 'Bearer realm="ares"');
+      assert.equal(none.body.error, 'unauthorized');
+
+      const wrong = await getJson(`${h.base}${p}`, { headers: { authorization: 'Bearer not-the-token-at-all-really' } });
+      assert.equal(wrong.status, 401, `${p} accepted a wrong token`);
+
+      const noScheme = await getJson(`${h.base}${p}`, { headers: { authorization: TOKEN } });
+      assert.equal(noScheme.status, 401, `${p} accepted a bare token without the Bearer scheme`);
+
+      const ok = await getJson(`${h.base}${p}`, { headers: AUTH });
+      assert.equal(ok.status, 200, `${p} refused the correct token`);
+    }
+
+    // HEAD is the free amplifier: identical work, zero bytes back. It is gated
+    // exactly like GET.
+    for (const p of GATED) {
+      const head = await fetch(`${h.base}${p}`, { method: 'HEAD' });
+      assert.equal(head.status, 401, `HEAD ${p} was not gated`);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('FIX B2: /healthz stays open for the container healthcheck; the dashboard shell does too', async () => {
+  const h = await harness({ ARES_API_TOKEN: TOKEN });
+  try {
+    const health = await getJson(`${h.base}/healthz`);
+    assert.equal(health.status, 200, 'the Docker healthcheck has no token and must keep working');
+    assert.equal(health.body.status, 'ok');
+    const ready = await fetch(`${h.base}/readyz`);
+    assert.ok(ready.status === 200 || ready.status === 503, 'readiness is a probe, not a data route');
+    assert.equal((await fetch(`${h.base}/`)).status, 200);
+    assert.equal((await fetch(`${h.base}/dashboard.js`)).status, 200);
+  } finally {
+    await h.close();
+  }
+});
+
+test('FIX B2: with NO token configured the read routes stay open (the bind refusal is the guard)', async () => {
+  const h = await harness();
+  try {
+    for (const p of GATED) {
+      const r = await getJson(`${h.base}${p}`);
+      assert.equal(r.status, 200, `${p} must still answer on a loopback-only, tokenless instance`);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('FIX B2: auth state still never reveals whether a route exists', async () => {
+  const h = await harness({ ARES_API_TOKEN: TOKEN });
+  try {
+    const anon = await getJson(`${h.base}/api/does-not-exist`);
+    const authed = await getJson(`${h.base}/api/does-not-exist`, { headers: AUTH });
+    assert.equal(anon.status, 404);
+    assert.equal(authed.status, 404);
+    assert.deepEqual(anon.body, authed.body);
+    // And a wrong METHOD on a real route is still 405, ahead of the auth gate,
+    // so the shapes of "no" are unchanged.
+    const wrongMethod = await getJson(`${h.base}/api/state`, { method: 'POST' });
+    assert.equal(wrongMethod.status, 405);
+    assert.equal(wrongMethod.res.headers.get('allow'), 'GET, HEAD');
+  } finally {
+    await h.close();
+  }
+});
+
+/* ===================================================================== */
+/* FIX B1b — /api/report serves a cached verdict, never a fresh O(n) scan */
+/* ===================================================================== */
+
+test('FIX B1b: /api/report never calls ledger.verify(); it serves the cached verdict', async () => {
+  const h = await harness();
+  try {
+    // Justified cast: counting calls to the exact method that used to re-hash
+    // every entry on the request thread.
+    const led = h.ares.ledger as unknown as { verify: (o?: unknown) => unknown };
+    const real = led.verify.bind(h.ares.ledger);
+    let calls = 0;
+    led.verify = (o?: unknown) => {
+      calls += 1;
+      return real(o);
+    };
+
+    for (let i = 0; i < 5; i++) {
+      const r = await getJson(`${h.base}/api/report`);
+      assert.equal(r.status, 200);
+      assert.equal(r.body.ledger.verified, true);
+      assert.equal(r.body.ledger.cached, true);
+      assert.equal(typeof r.body.ledger.verifiedAt, 'number');
+      assert.equal(typeof r.body.ledger.verifiedAtSeq, 'number');
+    }
+    // HEAD did IDENTICAL work and returned zero bytes: a free amplifier.
+    for (let i = 0; i < 5; i++) await fetch(`${h.base}/api/report`, { method: 'HEAD' });
+
+    assert.equal(calls, 0, 'ten requests re-hashed the chain zero times (it was once per request, ~4.9s at 400k)');
+    assert.equal(h.ares.killSwitch.tripped, false);
+  } finally {
+    await h.close();
+  }
+});
+
+test('FIX B1b: a burst of unauthenticated GET+HEAD /api/report cannot halt the swarm', async () => {
+  const h = await harness();
+  try {
+    // Five concurrent reads per tick, three ticks — the exact shape of the
+    // reported remote halt.
+    for (let tick = 0; tick < 3; tick++) {
+      await Promise.all([
+        fetch(`${h.base}/api/report`),
+        fetch(`${h.base}/api/report`, { method: 'HEAD' }),
+        fetch(`${h.base}/api/state`),
+        fetch(`${h.base}/metrics`),
+        fetch(`${h.base}/api/ledger?limit=1`),
+      ]);
+      await h.ares.supervisor.runTick(tick);
+      h.clock.advance(1_000);
+    }
+    assert.equal(h.ares.killSwitch.tripped, false, 'no credential was presented and nothing halted');
+    assert.equal(h.ares.supervisor.snapshot().overruns, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test('FIX B1: /api/ledger?limit=1 does bounded WORK, not just a bounded response', async () => {
+  const h = await harness();
+  try {
+    const r = await getJson(`${h.base}/api/ledger?limit=1`);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.returned <= 1, true);
+    assert.equal(r.body.entries.length <= 1, true);
+    // The most recent entry, which is what "limit" has always meant.
+    assert.equal(r.body.entries[0].seq, r.body.size);
+    // entries() walks backwards from the newest and stops; it no longer
+    // materialises every row and slices the end off it.
+    const stats = h.ares.ledger.stats();
+    assert.ok(stats.retained <= stats.tailCap);
+  } finally {
+    await h.close();
+  }
+});
+
+/* ===================================================================== */
+/* FIX B6 — /readyz tells the truth about a stalled or crashed loop       */
+/* ===================================================================== */
+
+test('FIX B6: /readyz reports the loop’s liveness, not just a boolean nobody clears', async () => {
+  const h = await harness();
+  try {
+    const r = await getJson(`${h.base}/readyz`);
+    assert.equal(r.status, 503);
+    assert.equal(r.body.running, false);
+    assert.equal(typeof r.body.stalled, 'boolean');
+    assert.equal(typeof r.body.loopCrashed, 'boolean');
+    assert.equal(typeof r.body.tickOverdueMs, 'number');
+    assert.equal(r.body.tickIntervalMs, 1_000);
+  } finally {
+    await h.close();
+  }
+});
+
+/* ===================================================================== */
+/* FIX B8 — the halt route locks out after repeated auth failures         */
+/* ===================================================================== */
+
+test('FIX B8: repeated halt auth failures lock the route out instead of only incrementing a counter', async () => {
+  const h = await harness({ ARES_API_TOKEN: TOKEN });
+  try {
+    for (let i = 0; i < AUTH_LOCKOUT_AFTER - 1; i++) {
+      const r = await getJson(`${h.base}/api/halt`, {
+        method: 'POST',
+        headers: { authorization: `Bearer guess-number-${String(i)}` },
+      });
+      assert.equal(r.status, 401, 'early guesses are ordinary refusals');
+    }
+    const locking = await getJson(`${h.base}/api/halt`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer guess-that-locks' },
+    });
+    assert.equal(locking.status, 429);
+    assert.equal(locking.body.error, 'too_many_attempts');
+    assert.equal(locking.body.retryAfterMs, AUTH_LOCKOUT_MS);
+    assert.ok(Number(locking.res.headers.get('retry-after')) > 0);
+
+    // Locked out means locked out: even the CORRECT token is refused, so an
+    // attacker cannot keep guessing and a stolen token cannot be used mid-run.
+    const correct = await getJson(`${h.base}/api/halt`, { method: 'POST', headers: AUTH });
+    assert.equal(correct.status, 429);
+    assert.equal(h.ares.killSwitch.tripped, false);
+    assert.ok(h.ares.api.stats().lockouts >= 1);
+    assert.equal(h.ares.api.stats().lockedOut, true);
+
+    // The window is measured on the injected clock, so it is deterministic.
+    h.clock.advance(AUTH_LOCKOUT_MS + 1);
+    assert.equal(h.ares.api.stats().lockedOut, false);
+    const after = await getJson(`${h.base}/api/halt`, { method: 'POST', headers: AUTH });
+    assert.equal(after.status, 200, 'the operator can halt again once the window has passed');
+    assert.equal(h.ares.killSwitch.tripped, true);
+    // The refusal leaked nothing.
+    assert.equal(JSON.stringify(locking.body).includes(TOKEN), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test('FIX B8: a successful halt authentication clears the failure streak', async () => {
+  const h = await harness({ ARES_API_TOKEN: TOKEN });
+  try {
+    for (let i = 0; i < AUTH_LOCKOUT_AFTER - 1; i++) {
+      await getJson(`${h.base}/api/halt`, { method: 'POST', headers: { authorization: 'Bearer nope' } });
+    }
+    assert.equal(h.ares.api.stats().consecutiveAuthFailures, AUTH_LOCKOUT_AFTER - 1);
+    const ok = await getJson(`${h.base}/api/halt`, { method: 'POST', headers: AUTH });
+    assert.equal(ok.status, 200);
+    assert.equal(h.ares.api.stats().consecutiveAuthFailures, 0);
+    assert.equal(h.ares.api.stats().lockedOut, false);
+  } finally {
+    await h.close();
+  }
+});
+
+/* ===================================================================== */
+/* FIX B8 — Prometheus label escaping covers the carriage return          */
+/* ===================================================================== */
+
+test('FIX B8: /metrics escapes carriage returns in label values', async () => {
+  const h = await harness();
+  try {
+    const before = h.ares.api.metricsText();
+    assert.equal(before.includes('\r'), false);
+
+    // Justified cast: force a hostile id onto a live agent to prove the
+    // escaper, rather than asserting on a regex by eye.
+    const agent = h.ares.registry.all()[0];
+    assert.ok(agent);
+    const original = agent.id;
+    (agent as unknown as { id: string }).id = 'evil\r\nares_up 999';
+    try {
+      const text = h.ares.api.metricsText();
+      assert.equal(text.includes('evil\r'), false, 'a raw CR would inject a second sample line');
+      assert.match(text, /agent="evil\\r\\nares_up 999"/);
+      assert.equal(text.split('\n').filter((l) => l === 'ares_up 999').length, 0);
+    } finally {
+      (agent as unknown as { id: string }).id = original;
+    }
+  } finally {
+    await h.close();
   }
 });

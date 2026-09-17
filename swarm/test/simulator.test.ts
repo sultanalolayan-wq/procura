@@ -18,11 +18,22 @@ import {
   DEFAULT_CHANNEL_PARAMS,
   MarketSimulator,
   feeOnBps,
+  fillCosts,
   resolveParams,
+  vatOnGross,
   type SimFill,
 } from '../src/channels/simulator.js';
 
 const CH = 'digitalassets';
+
+/** First SKU on a channel that is not part of its permanently dead tail. */
+function liveSku(s: MarketSimulator, channel: string): string {
+  for (let i = 0; i < 64; i++) {
+    const sku = `${channel}-sku-${String(i).padStart(3, '0')}`;
+    if (!s.isDeadSku(channel, sku)) return sku;
+  }
+  throw new Error(`every SKU on ${channel} is dead`);
+}
 
 function sim(seed = 1337, channels: Record<string, Record<string, unknown>> = { [CH]: {} }): MarketSimulator {
   return new MarketSimulator({ rng: makeRng(seed), clock: new TestClock(), logger: nullLogger }, channels);
@@ -212,8 +223,10 @@ test('listing fees are charged whether or not the item sells', () => {
   assert.ok(p.listingFeeMinor > 0, 'this channel is supposed to charge to list');
   const before = s.counters(CH).feesMinor;
   const r = s.listOffer(CH, 'never-sells', 'digitalassets-sku-001', 10_000_000, 1, 0, 3);
-  assert.equal(r.feeMinor, p.listingFeeMinor);
-  assert.equal(s.counters(CH).feesMinor, before + p.listingFeeMinor);
+  assert.equal(r.feeMinor, p.listingFeeMinor, 'listOffer reports the listing fee itself, unmixed');
+  // ...and the fixed platform overhead that has accrued since the last
+  // transaction falls due at the same moment, reported separately.
+  assert.equal(s.counters(CH).feesMinor, before + p.listingFeeMinor + r.platformChargeMinor);
   s.advanceTo(10);
   assert.equal(s.counters(CH).expired, 1, 'an absurdly priced listing must expire unsold');
   // Fee kept, nothing sold.
@@ -256,10 +269,12 @@ test('cash from a sale is NOT available on the tick the sale happens', () => {
 
 test('collectFills drains: a second call in the same tick returns nothing', () => {
   const s = sim(88);
-  const sku = 'digitalassets-sku-003';
+  // Deadness is a property of the SKU now, so a test that needs fills must list
+  // something sellable; and settlement is ~10x longer, so it must wait longer.
+  const sku = liveSku(s, CH);
   for (let t = 0; t < 60; t++) s.listOffer(CH, `o${t}`, sku, Math.round(s.latentValueMinor(CH, sku, t) * 0.4), 1, t, 5);
   let sawFills = false;
-  for (let t = 0; t < 80; t++) {
+  for (let t = 0; t < 60 + s.paramsOf(CH).settlementDelayTicks + 20; t++) {
     const first = s.collectFills(CH, t);
     const second = s.collectFills(CH, t);
     assert.deepEqual(second, [], 'second collect in the same tick must be empty');
@@ -413,4 +428,241 @@ test('the simulator reads wall time only through the injected clock', () => {
   assert.equal(s.nowMs(), 999);
   clock.advance(500);
   assert.equal(s.nowMs(), 1499);
+});
+
+/* ------------------------------------------------ the honest cost of an order */
+
+test('every real cost of an order is charged in the fill path, itemised', () => {
+  const p = resolveParams('ksa_ecom');
+  assert.ok(p.fulfilmentPerOrderMinor >= 1_500, 'the shipping label must be on the books');
+  const gross = 5_000; // SAR 50.00, inside this channel's SAR 32-65 band
+  const c = fillCosts(p, gross, 1, 0);
+
+  assert.equal(c.commissionMinor, feeOnBps(gross, p.sellCommissionBps));
+  assert.equal(c.fulfilmentMinor, p.fulfilmentPerOrderMinor, 'charged ONCE per order');
+  assert.equal(c.packagingMinor, p.packagingPerUnitMinor, 'charged per unit');
+  assert.equal(c.paymentMinor, feeOnBps(gross, p.paymentFeeBps) + p.paymentFeeFlatMinor);
+  assert.equal(
+    c.sellerCostMinor,
+    c.commissionMinor + c.fulfilmentMinor + c.packagingMinor + c.paymentMinor + c.platformMinor,
+  );
+  assert.equal(c.totalMinor, c.sellerCostMinor + c.vatMinor + c.vatOnFeesMinor);
+
+  // The council's benchmark: real KSA per-order cost at this price band is
+  // 40-70% of order value. Anything below that band means a cost is missing.
+  const share = c.sellerCostMinor / gross;
+  assert.ok(share >= 0.4 && share <= 0.7, `per-order cost is ${(share * 100).toFixed(1)}% of gross, expected 40-70%`);
+
+  // Packaging really is per UNIT, fulfilment really is per ORDER.
+  const three = fillCosts(p, gross * 3, 3, 0);
+  assert.equal(three.fulfilmentMinor, c.fulfilmentMinor);
+  assert.equal(three.packagingMinor, c.packagingMinor * 3);
+});
+
+test('VAT is DEDUCTED, not just displayed: proceeds = gross - vat - fees*(1+vatRate)', () => {
+  const p = resolveParams('ksa_ecom');
+  assert.ok(p.vatRateBps > 0);
+  for (const gross of [3_200, 5_000, 6_500, 12_345]) {
+    const c = fillCosts(p, gross, 1, 0);
+    const proceeds = gross - c.totalMinor;
+    const net = Math.round((gross * 10_000) / (10_000 + p.vatRateBps));
+    assert.equal(c.vatMinor, gross - net, 'VAT is the inclusive component of the displayed price');
+    assert.equal(c.vatOnFeesMinor, feeOnBps(c.sellerCostMinor, p.vatRateBps), 'the platform charges VAT on its fees');
+    // The identity the reviewer asked for, in integer arithmetic.
+    assert.equal(proceeds, gross - c.vatMinor - (c.sellerCostMinor + c.vatOnFeesMinor));
+    assert.ok(proceeds < gross - c.vatMinor);
+  }
+  // A channel with no VAT degenerates cleanly: no VAT, no VAT on fees.
+  const noVat = resolveParams('digitalassets');
+  assert.equal(noVat.vatRateBps, 0);
+  const c0 = fillCosts(noVat, 5_000, 1, 0);
+  assert.equal(c0.vatMinor, 0);
+  assert.equal(c0.vatOnFeesMinor, 0);
+  assert.equal(c0.totalMinor, c0.sellerCostMinor);
+});
+
+test('vatRateBps is validated: a negative rate no longer divides by zero', () => {
+  // -10000 made the VAT-inclusive divisor (10000 + rate) zero.
+  assert.throws(() => resolveParams('ksa_ecom', { vatRateBps: -10_000 }), /vatRateBps/);
+  assert.throws(() => resolveParams('ksa_ecom', { vatRateBps: -1 }), /vatRateBps/);
+  assert.throws(() => resolveParams('ksa_ecom', { vatRateBps: 10_001 }), /vatRateBps/);
+  assert.throws(() => resolveParams('ksa_ecom', { vatRateBps: Number.NaN }), /vatRateBps/);
+  // The boundaries are legal: 0% and 100% are both arithmetically sound.
+  assert.equal(resolveParams('ksa_ecom', { vatRateBps: 0 }).vatRateBps, 0);
+  assert.equal(resolveParams('ksa_ecom', { vatRateBps: 10_000 }).vatRateBps, 10_000);
+  assert.equal(vatOnGross(10_000, 10_000), 5_000);
+  assert.equal(vatOnGross(10_000, 0), 0);
+});
+
+test('THE EXPERIMENT: adding the shipping label alone flips ksa_ecom from profit to loss', () => {
+  // A merchant that sources each unit at a fixed share of the market's own
+  // latent value, lists at that latent value, marks down 12% on every expiry and
+  // gives up after five attempts — i.e. it buys well, prices perfectly and works
+  // its unsold stock. Same seed, same draws, ONE knob: the per-order cost of
+  // actually delivering the thing.
+  const run = (overrides: Record<string, unknown>, cogsShare: number): number => {
+    const s = new MarketSimulator(
+      { rng: makeRng(4242), clock: new TestClock(), logger: nullLogger },
+      { ksa_ecom: overrides },
+    );
+    const sku = 'ksa_ecom-sku-000';
+    let cash = 0;
+    let n = 0;
+    let bought = 0;
+    const attempts = new Map<string, number>();
+    for (let t = 0; t < 500; t++) {
+      for (const f of s.collectFills('ksa_ecom', t)) cash += f.unitPriceMinor * f.qty - f.feeMinor;
+      for (const e of s.collectExpiries('ksa_ecom', t)) {
+        const a = attempts.get(e.offerId) ?? 1;
+        if (a >= 5) continue; // written off
+        const id = `r${n++}`;
+        const r = s.listOffer('ksa_ecom', id, e.sku, Math.max(1, Math.round(e.priceMinor * 0.88)), e.remaining, t, 14);
+        cash -= r.feeMinor + r.platformChargeMinor;
+        attempts.set(id, a + 1);
+      }
+      if (t < 250 && bought < 120) {
+        const v = s.latentValueMinor('ksa_ecom', sku, t);
+        cash -= Math.round(v * cogsShare); // cost of goods: a human sources the unit
+        bought++;
+        const id = `o${n++}`;
+        const r = s.listOffer('ksa_ecom', id, sku, v, 1, t, 14);
+        cash -= r.feeMinor + r.platformChargeMinor;
+        attempts.set(id, 1);
+      }
+    }
+    return cash;
+  };
+  const noShip = { fulfilmentPerOrderMinor: 0, packagingPerUnitMinor: 0 };
+
+  // A 55% gross margin, which is a good retail margin, not a marginal one.
+  const withoutShipping = run(noShip, 0.45);
+  const withShipping = run({}, 0.45);
+  assert.ok(withoutShipping > 0, `without a per-order shipping cost this merchant profits: ${withoutShipping}`);
+  assert.ok(
+    withShipping < 0,
+    `with the real per-order cost it must lose money, got ${withShipping} (vs ${withoutShipping} without)`,
+  );
+
+  // And the stronger statement: even a 75% gross margin cannot pay the label.
+  const fatWithout = run(noShip, 0.25);
+  const fatWith = run({}, 0.25);
+  assert.ok(fatWithout > 0);
+  assert.ok(fatWith < 0, `even at a 75% gross margin the shipping label wins: ${fatWith} vs ${fatWithout}`);
+});
+
+test('a listing below the per-order cost of serving it can never be profitable', () => {
+  const p = resolveParams('ksa_ecom');
+  // Break-even gross for a sale with ZERO cost of goods. Below this the order
+  // loses money before anyone has paid for the item itself.
+  let breakEven = 0;
+  for (let g = 1; g <= 20_000; g++) {
+    if (g - fillCosts(p, g, 1, 0).totalMinor > 0) { breakEven = g; break; }
+  }
+  assert.ok(breakEven > 3_000, `break-even is only ${breakEven} halalas — a cost is missing`);
+  // The channel's own price band starts at roughly SAR 32 (baseValueMinor with
+  // dispersion), so a real part of the assortment cannot be sold at a profit.
+  assert.ok(breakEven > p.baseValueMinor * 0.6, 'break-even must land inside the channel price band');
+  assert.equal(3_000 - fillCosts(p, 3_000, 1, 0).totalMinor < 0, true, 'a SAR 30 order loses money');
+});
+
+test('the dataproducts channel is no longer structurally incapable of losing money', () => {
+  const p = resolveParams('dataproducts');
+  // The old preset: unitCost 0, listingFee 0, buyCommission 0. The seller's
+  // floor rule then reduced to "price >= 9% of price", true for every price.
+  assert.ok(p.listingFeeMinor > 0, 'an unsold listing must cost real money');
+  assert.ok(p.fulfilmentPerOrderMinor + p.paymentFeeFlatMinor > 0, 'a sale must carry a per-order cost');
+  const s = sim(99, { dataproducts: {} });
+  const before = s.counters('dataproducts').feesMinor;
+  // List something absurd so it certainly never sells, then let it expire.
+  s.listOffer('dataproducts', 'never', 'dataproducts-sku-000', 50_000_000, 1, 0, 4);
+  s.advanceTo(10);
+  const after = s.counters('dataproducts');
+  assert.equal(after.filled, 0);
+  assert.equal(after.expired, 1);
+  assert.ok(after.feesMinor - before >= p.listingFeeMinor, 'the listing fee is a realised loss');
+  // And at a plausible price, a FILL still costs the seller something.
+  const c = fillCosts(p, 6_500, 1, 0);
+  assert.ok(c.totalMinor > 0 && c.totalMinor < 6_500, `a data product sale must cost something: ${c.totalMinor}`);
+});
+
+test('fixed platform overhead accrues every tick, whether or not anything is sold', () => {
+  const s = sim(31, { ksa_ecom: {} });
+  const p = s.paramsOf('ksa_ecom');
+  assert.ok(p.platformFeePerTickMinor > 0, 'a seller account is not free');
+  s.advanceTo(9); // ticks 0..9 inclusive => 10 ticks
+  assert.equal(s.counters('ksa_ecom').platformAccruedMinor, p.platformFeePerTickMinor * 10);
+  assert.equal(s.platformAccrual('ksa_ecom'), p.platformFeePerTickMinor * 10);
+  assert.equal(s.counters('ksa_ecom').platformChargedMinor, 0, 'not collected until the swarm transacts');
+
+  // The next transaction collects everything accrued, exactly once.
+  const r = s.listOffer('ksa_ecom', 'p1', 'ksa_ecom-sku-000', 5_000, 1, 9, 4);
+  assert.equal(r.platformChargeMinor, p.platformFeePerTickMinor * 10);
+  assert.equal(s.platformAccrual('ksa_ecom'), 0);
+  assert.equal(s.counters('ksa_ecom').platformChargedMinor, p.platformFeePerTickMinor * 10);
+  const r2 = s.listOffer('ksa_ecom', 'p2', 'ksa_ecom-sku-000', 5_000, 1, 9, 4);
+  assert.equal(r2.platformChargeMinor, 0, 'overhead is never charged twice for the same ticks');
+});
+
+/* ------------------------------------------------- obsolescence and dead stock */
+
+test('deadness is a property of the SKU, not of the listing: relisting a dud never works', () => {
+  const s = sim(5150, { dataproducts: {} });
+  const p = s.paramsOf('dataproducts');
+  assert.ok(p.deadListingProb > 0);
+  const skus = Array.from({ length: p.skuCount }, (_, i) => `dataproducts-sku-${String(i).padStart(3, '0')}`);
+  const dead = skus.filter((k) => s.isDeadSku('dataproducts', k));
+  assert.ok(dead.length > 0, 'a fraction of the assortment must be permanently dead');
+  assert.ok(dead.length < skus.length, 'but not all of it');
+
+  // Relist the same dud twelve times, always well below latent value. Under the
+  // old per-listing draw, P(dead twelve times) was ~0.000005% and every dud
+  // eventually sold — teaching "relist and it will sell".
+  const dud = dead[0] as string;
+  let fees = 0;
+  for (let i = 0; i < 12; i++) {
+    const t = i * 20;
+    const v = s.latentValueMinor('dataproducts', dud, t);
+    const r = s.listOffer('dataproducts', `relist-${i}`, dud, Math.max(1, Math.round(v * 0.2)), 1, t, 16);
+    fees += r.feeMinor + r.platformChargeMinor;
+    s.advanceTo(t + 18);
+  }
+  assert.equal(s.counters('dataproducts').filled, 0, 'a dead SKU must never sell, however often it is relisted');
+  assert.equal(s.counters('dataproducts').expired, 12);
+  assert.ok(fees > 0, 'and every relist burned a real listing fee');
+});
+
+test('holding is not free optionality: value drifts down and can collapse permanently', () => {
+  const p = resolveParams('digitalassets');
+  assert.ok(p.valueDriftBps < 0, 'without negative drift, "wait it out" strictly dominates selling');
+  assert.ok(p.obsolescenceProb > 0 && p.obsolescenceFactor < 1);
+
+  // With no shocks and no mean reversion to fight it, the mean must decay.
+  const s = new MarketSimulator(
+    { rng: makeRng(1), clock: new TestClock(), logger: nullLogger },
+    { digitalassets: { ouSigma: 0, demandNoiseSigma: 0, seasonAmplitude: 0, obsolescenceProb: 0, skuCount: 4 } },
+  );
+  const sku = 'digitalassets-sku-000';
+  const v0 = s.latentValueMinor('digitalassets', sku, 0);
+  const v200 = s.latentValueMinor('digitalassets', sku, 200);
+  assert.ok(v200 < v0, `latent value must decay without drift support: ${v0} -> ${v200}`);
+
+  // Obsolescence is PERMANENT: forced to certainty, one tick destroys the mean.
+  const c = new MarketSimulator(
+    { rng: makeRng(2), clock: new TestClock(), logger: nullLogger },
+    { digitalassets: { ouSigma: 0, demandNoiseSigma: 0, seasonAmplitude: 0, obsolescenceProb: 1, obsolescenceFactor: 0.5, skuCount: 2 } },
+  );
+  const before = c.latentValueMinor('digitalassets', 'digitalassets-sku-000', 0);
+  const after = c.latentValueMinor('digitalassets', 'digitalassets-sku-000', 3);
+  assert.ok(after < before / 4, `an obsoleted SKU must not recover: ${before} -> ${after}`);
+  assert.ok(c.counters('digitalassets').obsoleted > 0);
+});
+
+test('settlement is slow enough to matter: cash conversion is not a couple of ticks', () => {
+  for (const ch of ['dataproducts', 'digitalassets', 'ksa_ecom']) {
+    const p = resolveParams(ch);
+    // The old values (2, 5, 3) let a naive strategy recycle capital almost
+    // instantly — the simulator's own comment called that "exactly the
+    // unrealistic behaviour this simulator exists to deny", and was off by ~10x.
+    assert.ok(p.settlementDelayTicks >= 20, `${ch} settles in ${p.settlementDelayTicks} ticks, far too fast`);
+  }
 });

@@ -3,10 +3,12 @@
  * Invariants: trip() is monotonic (first reason wins, callbacks fire exactly
  * once each, a throwing callback can neither unlatch it nor starve its peers);
  * the latch NEVER clears in-process; watchFile() polls `${dataDir}/HALT`
- * through the injected Clock only. Callers: budget, policy, agents, supervisor.
+ * through the injected Clock only, with lstat so a dangling symlink cannot
+ * disarm it; the trip reason never contains the path (it reaches API bodies).
+ * Callers: budget, policy, agents, supervisor.
  */
 
-import { existsSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type { Clock } from '../core/clock.js';
 import { nullLogger, type Logger } from '../core/logger.js';
@@ -148,17 +150,37 @@ export class KillSwitch {
       try {
         while (!stopped && !this.latched) {
           let present = false;
+          let kind = 'file';
           try {
-            present = existsSync(file);
+            // lstatSync, NOT existsSync. existsSync RESOLVES symlinks, so a
+            // dangling symlink named HALT — which anyone with write access to
+            // the data directory can pre-plant — reported false. The operator
+            // then ran the documented `touch`, `ls` showed the file, and the
+            // emergency stop never tripped. lstat looks at the entry itself,
+            // and ANY entry trips: file, directory or broken symlink. Tripping
+            // on something unexpected is the correct failure direction for a
+            // stop button; refusing to trip is not.
+            const st = lstatSync(file);
+            present = true;
+            kind = st.isSymbolicLink() ? 'symlink' : st.isDirectory() ? 'directory' : 'file';
           } catch (err) {
-            // An unreadable data dir is an operational problem, not a halt.
-            this.logger.warn('killswitch.watch_stat_failed', {
-              file,
-              error: err instanceof Error ? err.message : String(err),
-            });
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code !== 'ENOENT') {
+              // The entry exists but cannot be stat'd (permissions, a broken
+              // mount). An emergency stop that cannot read its own trigger is
+              // not a working emergency stop, so this trips too.
+              present = true;
+              kind = 'unreadable';
+              this.logger.warn('killswitch.watch_stat_failed', {
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
           if (present) {
-            this.trip(`halt file present: ${file}`, { file });
+            // The PATH goes in meta, never in the reason: the reason is
+            // returned verbatim by API routes, and server.ts's stated
+            // invariant is that no response body contains a file path.
+            this.trip(`halt file present (${kind})`, { file, kind });
             break;
           }
           await clock.sleep(intervalMs);

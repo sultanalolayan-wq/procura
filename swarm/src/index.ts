@@ -9,7 +9,7 @@
 
 import { loadConfig } from './core/config.js';
 import { AresError } from './core/errors.js';
-import { bootstrap } from './runtime/orchestrator.js';
+import { bootstrap, startupExitCode } from './runtime/orchestrator.js';
 
 export { bootstrap } from './runtime/orchestrator.js';
 export { Supervisor } from './runtime/supervisor.js';
@@ -44,7 +44,11 @@ if (invokedDirectly) {
     // readable block — this is the one place a human is definitely watching.
     const code = err instanceof AresError ? err.code : 'STARTUP_FAILED';
     const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`ARES failed to start [${code}]\n${msg}\n`);
-    process.exit(1);
+    // A corrupt ledger exits with its OWN code (and leaves a sentinel file), so
+    // a restart policy cannot quietly turn a broken audit trail into an
+    // indistinguishable crash loop.
+    const exitCode = startupExitCode(err);
+    process.stderr.write(`ARES failed to start [${code}] (exit ${String(exitCode)})\n${msg}\n`);
+    process.exit(exitCode);
   });
 }

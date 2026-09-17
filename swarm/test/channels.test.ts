@@ -53,6 +53,15 @@ async function ready(seed = 1337): Promise<Stack> {
   return s;
 }
 
+/** First SKU on a channel that is not part of its permanently dead tail. */
+function liveSku(sim: MarketSimulator, channel: string): string {
+  for (let i = 0; i < 64; i++) {
+    const sku = `${channel}-sku-${String(i).padStart(3, '0')}`;
+    if (!sim.isDeadSku(channel, sku)) return sku;
+  }
+  throw new Error(`every SKU on ${channel} is dead`);
+}
+
 function offerFor(channel: string, sku: string, price: Money, tick: number, id = 'of1'): Offer {
   return {
     id,
@@ -86,13 +95,39 @@ test('each channel declares exactly the capabilities the spec requires', async (
     { canBuy: true, canSell: true, buyRequiresHumanApproval: false, jurisdiction: 'GLOBAL', tosNote: undefined },
   );
 
+  // CHANGED DELIBERATELY. ksa_ecom used to declare canBuy:true together with
+  // buyRequiresHumanApproval:true, which policy.checkChannel correctly read as
+  // an inconsistent capability set and used to reject the WHOLE adapter at boot
+  // — so its sell path, SAR pricing and VAT handling never ran in a default run.
+  // The honest declaration is SELL-ONLY: there is no automated buy path at all.
   assert.equal(ke.name, 'ksa_ecom');
-  assert.equal(ke.capabilities.canBuy, true);
-  assert.equal(ke.capabilities.buyRequiresHumanApproval, true);
+  assert.equal(ke.capabilities.canBuy, false, 'ksa_ecom has no automated buy path, so it must not claim one');
+  assert.equal(ke.capabilities.buyRequiresHumanApproval, true, 'still true: it records WHY there is no buy path');
   assert.equal(ke.capabilities.canSell, true);
   assert.equal(ke.capabilities.jurisdiction, 'SA');
-  assert.match(ke.capabilities.tosNote, /terms of service/i);
+  assert.match(ke.capabilities.tosNote, /terms of service|current terms/i);
   assert.match(ke.capabilities.tosNote, /human in the loop/i);
+});
+
+test('the ksa_ecom ToS note is labelled an UNVERIFIED assumption, not asserted as fact', async () => {
+  const { ke } = await ready();
+  const note = ke.capabilities.tosNote;
+  // The file already labels its VAT rate scrupulously. The ToS claim named no
+  // platform, cited no clause and carried no date, yet was stated flatly — an
+  // asymmetry in candour between two equally unverified claims.
+  assert.match(note, /UNVERIFIED/i, 'the ToS claim must be labelled unverified, like the VAT assumption');
+  assert.match(note, /ASSUM/i);
+  assert.match(note, /confirm/i);
+  assert.match(note, /no platform is named/i);
+  // "Selling/listing is permitted for a merchant account" was flatly wrong as an
+  // unconditional claim: merchant APIs carry their own conditions.
+  assert.equal(/Selling\/listing is permitted/.test(note), false, 'the flat permission claim must be gone');
+  assert.match(note, /approved (merchant )?account/i);
+  assert.match(note, /rate limit/i);
+  assert.match(note, /repricing/i);
+  // The VAT note keeps its own labelling — this test must not have relaxed it.
+  assert.match(VAT_ASSUMPTION_NOTE, /ASSUMPTION/i);
+  assert.match(VAT_ASSUMPTION_NOTE, /legal reviewer/i);
 });
 
 /* --------------------------------------------------------------- lifecycle */
@@ -201,7 +236,9 @@ test('mint() on dataproducts is idempotent and costs nothing', async () => {
 
 test('poll() returns each fill exactly once; a second poll in the same tick is empty', async () => {
   const { sim, dp } = await ready(2024);
-  const sku = 'dataproducts-sku-000';
+  // A fraction of every assortment is PERMANENTLY dead (drawn once per SKU at
+  // registration), so a test that needs fills has to list something sellable.
+  const sku = liveSku(sim, 'dataproducts');
   let sawFills = false;
   for (let t = 0; t < 120; t++) {
     // Keep a steady stream of cheap listings so fills definitely occur.
@@ -213,6 +250,7 @@ test('poll() returns each fill exactly once; a second poll in the same tick is e
     if (first.length > 0) sawFills = true;
   }
   assert.ok(sawFills, 'expected at least one fill over 120 ticks');
+  assert.equal(sim.isDeadSku('dataproducts', sku), false);
 });
 
 test('pollExpired() also reports each expiry exactly once', async () => {
@@ -265,8 +303,51 @@ test('ksa_ecom.buy() ALWAYS throws PolicyDenied, initialised or not', async () =
   for (const attempt of [1, 2, 3]) {
     await assert.rejects(() => ke.buy(opp, attempt, 5, `replayed-key`), PolicyDenied);
   }
-  assert.deepEqual(sim.counters('ksa_ecom'), { ...before, listed: before.listed, buys: before.buys });
-  assert.equal(sim.counters('ksa_ecom').buys, before.buys, 'no purchase may ever be recorded on ksa_ecom');
+  // Compared field by field rather than deep-equal on the whole counter block:
+  // fixed platform overhead now ACCRUES every tick whether or not anything
+  // happens, so "nothing changed at all" is no longer the right assertion. What
+  // must not change is anything to do with acquiring goods.
+  const after = sim.counters('ksa_ecom');
+  assert.equal(after.buys, before.buys, 'no purchase may ever be recorded on ksa_ecom');
+  assert.equal(after.boughtUnits, before.boughtUnits);
+  assert.equal(after.listed, before.listed);
+  assert.equal(after.filled, before.filled);
+});
+
+test('the ksa_ecom buy refusal survives the capability flags being MUTATED', async () => {
+  const { ke } = await ready(7);
+  const dummy: Opportunity = {
+    id: 'x',
+    channel: 'ksa_ecom',
+    sku: 'ksa_ecom-sku-000',
+    title: 't',
+    askPrice: money(1000, 'SAR'),
+    estResaleValue: money(1200, 'SAR'),
+    confidence: 0.99,
+    ttlTicks: 3,
+    meta: {},
+  };
+  // The whole protection used to key off one boolean in one frozen object
+  // literal. A frozen literal is a convention, not a guarantee: the property is
+  // configurable via defineProperty, and the getter itself can be replaced.
+  const hostile: Record<string, unknown>[] = [
+    { canBuy: true, canSell: true, buyRequiresHumanApproval: false, jurisdiction: 'SA', tosNote: 'anything goes' },
+    {},
+  ];
+  for (const caps of hostile) {
+    Object.defineProperty(ke, 'capabilities', { value: caps, configurable: true, writable: true });
+    await assert.rejects(
+      () => ke.buy(dummy, 1, 0, 'mutated'),
+      (e: unknown) => {
+        assert.ok(e instanceof PolicyDenied, `expected PolicyDenied, got ${String(e)}`);
+        assert.equal(e.code, 'TOS_AUTOMATED_PURCHASE_PROHIBITED');
+        return true;
+      },
+    );
+  }
+  // ...and with the property removed entirely.
+  Object.defineProperty(ke, 'capabilities', { get: () => undefined, configurable: true });
+  await assert.rejects(() => ke.buy(dummy, 1, 0, 'gone'), PolicyDenied);
 });
 
 test('ksa_ecom sells normally in SAR with a VAT-inclusive display convention', async () => {
@@ -275,7 +356,14 @@ test('ksa_ecom sells normally in SAR with a VAT-inclusive display convention', a
   const offer = offerFor('ksa_ecom', 'ksa_ecom-sku-000', price, 1, 'ksa-offer');
   const res = await ke.publish(offer, 1, 'ksa-pub');
   assert.equal(res.offerId, 'ksa_ecom:ksa-offer');
-  assert.equal(res.feeMinor, ke.params.listingFeeMinor);
+  // CHANGED DELIBERATELY: the publish fee is now the listing fee PLUS any fixed
+  // platform overhead that has fallen due since the last transaction. Both are
+  // real cash leaving now, sale or no sale, so the caller must book both; the
+  // split is surfaced in the offer meta for the audit trail.
+  assert.equal(offer.meta['listingFeeMinor'], ke.params.listingFeeMinor);
+  assert.ok(ke.params.listingFeeMinor > 0, 'an unsold listing must be a real loss');
+  assert.equal(res.feeMinor, ke.params.listingFeeMinor + Number(offer.meta['platformChargeMinor']));
+  assert.ok(res.feeMinor >= ke.params.listingFeeMinor);
 
   assert.equal(offer.meta['priceDisplay'], 'VAT_INCLUSIVE');
   assert.equal(offer.meta['jurisdiction'], 'SA');
@@ -298,9 +386,41 @@ test('ksa_ecom opportunities carry the human-approval constraint in their meta',
   let opp: Opportunity | undefined;
   for (let t = 0; t < 20 && !opp; t++) opp = (await ke.scan(t, money(100_000, 'SAR')))[0];
   assert.ok(opp);
+  assert.equal(opp.meta['sellOnly'], true);
   assert.equal(opp.meta['buyRequiresHumanApproval'], true);
   assert.equal(opp.meta['automatedPurchaseProhibited'], true);
-  assert.match(String(opp.meta['tosNote']), /terms of service/i);
+  assert.match(String(opp.meta['tosNote']), /terms of service|current terms/i);
+});
+
+test('ksa_ecom DEDUCTS VAT in the fill path — it is not merely displayed', async () => {
+  const { sim, ke } = await ready(913);
+  const p = ke.params;
+  assert.ok(p.vatRateBps > 0, 'this test is about a channel that charges VAT');
+  const sku = liveSku(sim, 'ksa_ecom');
+  // Price well under latent value so it sells inside its TTL.
+  const grossUnit = Math.max(1, Math.round(sim.latentValueMinor('ksa_ecom', sku, 0) * 0.35));
+  await ke.publish(offerFor('ksa_ecom', sku, money(grossUnit, 'SAR'), 0, 'vat-offer'), 0, 'vat-pub');
+
+  let fill: { qty: number; unitPrice: Money; feeMinor: number } | undefined;
+  for (let t = 1; t <= 120 && !fill; t++) fill = (await ke.poll(t))[0];
+  assert.ok(fill, 'expected the listing to sell and settle');
+
+  const gross = fill.unitPrice.amount * fill.qty;
+  const vat = ke.vatBreakdown(gross).vatMinor;
+  assert.ok(vat > 0);
+  const proceeds = gross - fill.feeMinor;
+  // The swarm used to book the money it owes the tax authority as profit.
+  assert.ok(
+    fill.feeMinor > vat,
+    `the fee must carry the VAT (${vat}) AND the selling costs, got ${fill.feeMinor}`,
+  );
+  assert.ok(proceeds < gross - vat, 'proceeds must be below gross-minus-VAT: the fees are charged too');
+  // proceeds = gross - vat - fees*(1 + vatRate), to the rounding of integer math.
+  const fees = fill.feeMinor - vat - Math.ceil(((fill.feeMinor - vat) * p.vatRateBps) / (10_000 + p.vatRateBps));
+  assert.ok(fees > 0);
+  assert.equal(sim.counters('ksa_ecom').vatCollectedMinor >= vat, true, 'VAT collected is counted separately');
+  // The shipping label is in there too.
+  assert.ok(sim.counters('ksa_ecom').logisticsMinor >= p.fulfilmentPerOrderMinor);
 });
 
 /* ---------------------------------------------------- dataproducts specifics */

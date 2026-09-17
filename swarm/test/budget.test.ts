@@ -471,3 +471,69 @@ test('snapshot reports the halt state, outstanding reservations and per-agent ro
     h.close();
   }
 });
+
+/* ===== AMENDMENT A9: BUDGET_INSUFFICIENT_TOKENS was unreachable dead code ==== */
+
+test('A9: a token reservation the till cannot pay for is refused with its own code', () => {
+  // The old branch tested `amount > globalTokenCap - globalUsed`, which the
+  // GLOBAL_CAP check immediately above had already rejected — so the file
+  // promised a distinct reason code per refusal and shipped one that could never
+  // fire. It now guards what the caps cannot see: tokens are bought with CASH.
+  const h = harness();
+  try {
+    // Spend the till down to 750 halalas. Caps are untouched and generous.
+    const r = h.gov.reserve('a1', 'cash', 5_000, 1);
+    h.gov.commit(r, 5_000);
+    h.ledger.append({
+      tick: 1,
+      type: 'LOSS',
+      agentId: 'a1',
+      currency: 'SAR',
+      legs: [
+        { account: 'cash', amount: -(100_000 - 750) },
+        { account: 'writeoff', amount: 100_000 - 750 },
+      ],
+      idempotencyKey: 'drain-the-till',
+      meta: {},
+    });
+    assert.equal(h.gov.cashOnHand(), 750);
+
+    // 400,000 tokens costs exactly 750 — affordable, to the halala.
+    assert.equal(tokenCostMinor(400_000, 1875), 750);
+    assert.ok(h.gov.availableTokens('a1') >= 400_001, 'the CAPS are nowhere near the limit');
+    const ok = h.gov.reserve('a1', 'tokens', 400_000, 1);
+    h.gov.release(ok);
+
+    // One token more than the till can pay for.
+    const d = denial(() => h.gov.reserve('a1', 'tokens', 400_001, 1));
+    assert.equal(d.code, BudgetDeny.INSUFFICIENT_TOKENS, 'a genuinely distinct refusal, now reachable');
+    assert.match(d.message, /exceeds unreserved cash/);
+  } finally {
+    h.close();
+  }
+});
+
+test('A9: an outstanding cash reservation also makes compute unaffordable', () => {
+  const h = harness();
+  try {
+    h.ledger.append({
+      tick: 1,
+      type: 'LOSS',
+      agentId: 'a1',
+      currency: 'SAR',
+      legs: [
+        { account: 'cash', amount: -(100_000 - 900) },
+        { account: 'writeoff', amount: 100_000 - 900 },
+      ],
+      idempotencyKey: 'drain-2',
+      meta: {},
+    });
+    // 900 in the till, but 800 of it is already promised to somebody else.
+    h.gov.reserve('a2', 'cash', 800, 1);
+    const d = denial(() => h.gov.reserve('a1', 'tokens', 100_000, 1));
+    assert.equal(d.code, BudgetDeny.INSUFFICIENT_TOKENS);
+    assert.equal((d.meta ?? {})['freeCash'], 100, 'promised money is not spendable money');
+  } finally {
+    h.close();
+  }
+});

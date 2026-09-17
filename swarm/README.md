@@ -18,7 +18,12 @@ path — see [What live execution would require](#what-live-execution-would-requ
 The numbers on the dashboard and in `/api/report` are the output of a simulation.
 They are **not evidence of profitability** and must not be presented as a track
 record. A profitable run here means the simulator's parameters were favourable,
-nothing more.
+nothing more — and the parameters are chosen by us, in
+[`src/channels/simulator.ts`](src/channels/simulator.ts), not observed anywhere.
+
+Read [Can a channel actually lose money?](#can-a-channel-actually-lose-money)
+before quoting any figure this system produces. A simulated market that omits a
+real cost does not produce an optimistic result; it produces a meaningless one.
 
 Zero runtime dependencies. Node 22+, TypeScript, `node:` builtins only.
 
@@ -32,12 +37,26 @@ Zero runtime dependencies. Node 22+, TypeScript, `node:` builtins only.
 cd swarm
 npm install          # typescript + @types/node, dev only
 npm run build
-npm test             # 348 tests
-cp .env.example .env # then edit
+npm test
+cp .env.example .env
+
+# Set an operator token, or the red HALT button on the dashboard answers 401.
+# Skipping this is a valid choice — but then you MUST know the halt below.
+echo "ARES_API_TOKEN=$(openssl rand -hex 32)" >> .env
+
 npm start
 ```
 
 Then open <http://127.0.0.1:8787/>.
+
+**Halt it.** Two ways, and you should try the second one now rather than at 3am:
+
+```sh
+curl -X POST -H "Authorization: Bearer $ARES_API_TOKEN" http://127.0.0.1:8787/api/halt
+touch ./var/HALT     # works with NO token at all; the watcher trips within a second
+```
+
+Both are **irreversible for the life of the process**. See [Halting](#halting).
 
 A short, loud run you can watch:
 
@@ -54,13 +73,34 @@ process down immediately.
 ```sh
 cd swarm
 cp .env.example .env
+echo "ARES_API_TOKEN=$(openssl rand -hex 32)" >> .env   # REQUIRED under compose
 docker compose up --build
 ```
+
+The token is **not optional here**, and compose stops with an error naming it if
+it is missing. Inside the container the process binds `0.0.0.0` — the `ports:`
+mapping is what restricts access, and it publishes to host loopback only — and
+ARES refuses to start an unauthenticated non-loopback API. `cp .env.example .env
+&& docker compose up --build` used to build an image and then crash-loop on that
+refusal forever; now it fails immediately, before anything starts, with the
+reason.
+
+Do **not** "fix" that by setting `ARES_API_HOST=127.0.0.1` in the container. That
+binds the process to the *container's* loopback, which the published port cannot
+reach: you get a running container with an unreachable dashboard. The healthcheck
+probes the container's own routable address precisely so that this shows up as
+`unhealthy` instead of green.
+
+`restart: on-failure:5`, deliberately not `unless-stopped`: a corrupt ledger, a
+bad config or a missing token is a permanent failure, and restarting forever
+turns a loud crash into a silent loop nobody looks at.
 
 The API is published to `127.0.0.1:8787` on the host only. State (ledger, memory
 stores, snapshots) lives in the `ares-var` volume and survives restarts. The
 container runs as the unprivileged `node` user with a read-only root filesystem,
-all capabilities dropped and a 512 MB memory limit.
+all capabilities dropped and a 512 MB memory limit. Only `/app/var` is owned by
+that user: `/app/dist` stays root-owned, so a file-write primitive cannot become
+code execution on the next restart.
 
 To halt a running container without a token:
 
@@ -130,19 +170,98 @@ defaults (2 grace windows, 8 samples, 1 probation window) enforce exactly the
 same rule, but only once the verdict is based on enough evidence to mean
 anything.
 
-### Channels are gated, and one of them is rejected on purpose
+### Channels are gated, and one of them is sell-only
 
-`ksa_ecom` declares that its terms of service require human approval for every
-purchase. ARES has no human in the loop, so the policy engine refuses it at boot
-and logs the rejection:
+`ksa_ecom` is a **SELL-ONLY** channel. Its assumed terms of service require a
+human to approve every purchase, ARES has no human in the loop, and so the
+adapter offers no automated buy path at all: it declares `canBuy: false`, and
+`KsaEcomAdapter.buy()` throws `PolicyDenied` unconditionally — before the
+init/ready check, and without reading its own capability flags, so the refusal
+survives those flags being mutated. It is admitted at boot, and its sell path,
+SAR pricing and VAT handling do run.
+
+It did **not** used to. It declared `canBuy: true` *and*
+`buyRequiresHumanApproval: true`, which the policy engine correctly read as an
+internally inconsistent capability set and used to reject the whole adapter:
 
 ```json
 {"level":"warn","msg":"boot.channel_rejected","meta":{"channel":"ksa_ecom","code":"POLICY_CHANNEL_APPROVAL_UNAVAILABLE"}}
 ```
 
-That is the system working, not a misconfiguration. Booting with **no** usable
-channel left is a hard failure (`BOOT_NO_USABLE_CHANNELS`) — an idle swarm that
-reports healthy is worse than one that refuses to start.
+The gate was right; the declaration was wrong. The cost of the wrong declaration
+was that the headline Saudi capability — the VAT arithmetic, the SAR-only
+pricing, the VAT-inclusive display convention — was unreachable dead code behind
+an accurate-looking channel name, and the VAT code you would most want exercised
+was the least exercised code in the repository. The gate itself is unchanged: an
+adapter that genuinely claims `canBuy` while its own ToS note requires a human
+per purchase is still refused, and the denial now names the remedy.
+
+**A sell-only channel has no automated way to acquire stock.** In a default run
+the swarm therefore has no inventory to list on `ksa_ecom` and it produces no
+sales. That is the honest consequence of having no human in the loop, not a bug,
+and it is not papered over by minting free physical inventory. The channel's
+sell and VAT paths are exercised by `test/channels.test.ts` and
+`test/simulator.test.ts` instead.
+
+Booting with **no** usable channel left is a hard failure
+(`BOOT_NO_USABLE_CHANNELS`) — an idle swarm that reports healthy is worse than
+one that refuses to start.
+
+### Can a channel actually lose money?
+
+This is the only question that decides whether a reported profit means anything.
+
+| Channel | Acquisition | Per-order costs | Can a listing lose money? |
+| --- | --- | --- | --- |
+| `dataproducts` | minted at zero cost | listing fee, delivery, payment fee, platform overhead | **Yes** |
+| `digitalassets` | bought, commission both legs | listing fee, payment fee, platform overhead | **Yes** |
+| `ksa_ecom` | none (sell-only) | listing fee, **fulfilment**, packaging, payment fee, platform overhead, **VAT** | **Yes** |
+
+It has not always been yes. Until recently `dataproducts` minted at `unitCost 0`
+with `listingFee 0` and `buyCommission 0`, so the seller's floor rule — *refuse
+any listing that cannot clear cost of goods plus fees* — reduced to
+`price >= 9% of price`, which is true for every price. A listing on that channel
+was **structurally incapable of losing money**, and it was the channel that
+produced essentially all of the swarm's reported profit.
+
+What is charged now, in the fill path, itemised on every `SimFill`:
+
+- **commission** on the gross;
+- **fulfilment**, once per order — the shipping label;
+- **packaging**, per unit;
+- **payment processing**, bps of gross plus a flat per-order charge;
+- **platform overhead**, accrued every tick the channel is registered whether or
+  not anything sells, and collected at the next transaction;
+- **VAT**, *deducted*, not merely displayed: `proceeds = gross − VAT −
+  fees × (1 + VAT rate)`. The swarm used to book money owed to the tax authority
+  as profit.
+
+At `ksa_ecom`'s SAR 32–65 price band a single SAR 50.00 order carries SAR 29.50
+of seller cost (59% of gross) and SAR 40.45 of total deductions including VAT
+(81%). The break-even gross for an order with **zero** cost of goods is about
+SAR 37 — inside the channel's own price band, so part of the assortment cannot be
+sold at a profit at any margin.
+
+Two more things stopped being free. Stock ages: a SKU's long-run value drifts
+down every tick and can collapse permanently, so "wait for the mean to come
+back" is no longer a strictly dominant strategy. And a dud is a dud: whether a
+listing is dead is drawn **once per SKU** at registration, not per listing, so a
+fixed slice of the assortment never sells however often it is relisted. The old
+per-listing draw gave a 0.006% chance of six consecutive duds, which taught
+"relist and it will sell" — the opposite of the real lesson.
+
+Settlement was raised roughly tenfold (20–45 ticks). Real cash conversion is
+90–150 days; the previous 2–5 ticks let a naive strategy recycle capital almost
+instantly, which the simulator's own comment called "exactly the unrealistic
+behaviour this simulator exists to deny".
+
+**What this did to the reported result.** Same seed, same agents, 400 ticks,
+`ARES_SEED=1337`: the swarm used to finish **+SAR 602.63** on SAR 1,000 of
+starting capital, 96.6% of it from `dataproducts`. With the costs above it
+finishes **−SAR 203.91** and is halted by the drawdown brake. Seeds 777, 20 and
+4242 move the same way (+506.35 → −62.80, +600.85 → −168.85, +641.95 → −203.20).
+Every profitable result this project produced before that change was an artefact
+of costs the model did not charge.
 
 ---
 
@@ -189,17 +308,64 @@ out-of-band halt is then the file:
 touch ./var/HALT      # the watcher trips the kill switch within a second
 ```
 
+The dashboard prints the server's own explanation when a halt is refused,
+including the sentence naming that file — so an operator who has not configured
+a token is told what to do instead of reading `unauthorized` and concluding the
+emergency control is broken.
+
+### How do I find out WHEN it halted?
+
+The halt time is on the dashboard, next to the kill-switch state, absolute and
+relative: `HALTED at 17/09/2026, 04:12:33 (5h 18m ago)`. Four minutes and
+eighteen hours are very different situations and the page now distinguishes
+them. It is also in the API:
+
+```sh
+curl -s http://127.0.0.1:8787/api/state | grep -o '"killSwitch":{[^}]*}'
+# {"killSwitch":{"tripped":true,"reason":"max drawdown breached: 20391 > 20000","trippedAt":1758...}}
+```
+
+`trippedAt` is epoch milliseconds from the injected clock. The footer's
+"updated HH:MM:SS" is the **client's** clock at the last successful poll — it is
+how fresh the page is, never when anything happened — and it now ages visibly
+("updated 09:30:14 (4s ago)") and reddens once it is more than a few poll
+intervals old.
+
+The halt is also in the logs (`api.halted`, or the reason recorded by whichever
+governor tripped it) and in the ledger, which keeps its own tick-stamped record
+of everything that happened up to it.
+
 ---
 
 ## Reading the dashboard
 
-The page polls `/api/state` every three seconds. It follows
-`prefers-color-scheme`, works at phone width, loads no CDN, no external font and
-makes no request to anything but this API. If the API stops answering it turns
-the banner red and says so — it never silently shows stale numbers as if they
-were fresh.
+The page polls `/api/state` every three seconds, and each poll is aborted after
+2.5 seconds. It follows `prefers-color-scheme`, loads no CDN, no external font
+and makes no request to anything but this API.
+
+**On staleness.** A poll that fails *or hangs* dims every figure on the page,
+appends `(STALE)` to the headline numbers, reddens the banner and changes the
+browser tab title to `STALE — ARES`. It does this in the `<main>` body, not only
+in a header banner an operator on a phone has already scrolled past. Only one
+poll is ever in flight, and an older response can never overwrite a newer one.
+
+This used to be less true than the sentence here claimed. `fetch()` had no
+timeout, so a socket that accepted and never answered left the promise pending
+forever: the failure handler never ran, the banner never reddened, requests
+stacked every three seconds, and the page showed `LIVE` beside stale cash
+indefinitely. A hung API is more dangerous than a dead one, because it looks
+exactly like a healthy one.
+
+**At phone width** the layout reflows to a single column and everything is
+readable, but the Agents table is eight columns inside a horizontal scroller. The
+columns you need — status, net, verdict — are ordered first so they are visible
+without scrolling, and there is a one-line summary above it
+(`4 agents · 3 active · 0 probation · 0 quarantined · 1 terminated`) so "did
+anything get terminated?" never requires scrolling sideways at all.
 
 - **PAPER banner** (top). If it ever says anything else, stop and investigate.
+  On a halt this banner is replaced by the halt itself — reason and time — and
+  the tab title becomes `HALTED — ARES`.
 - **Kill switch** — `LIVE` or `HALTED`, with the halt reason.
 - **Tick** — the current tick, plus ticks executed, **ticks skipped** (a tick
   that overran its interval; the loop resumes at the tick that is due now rather
@@ -207,14 +373,35 @@ were fresh.
   overrun count.
 - **Cash on hand** against starting cash, and **drawdown against its limit** with
   a bar. When that bar fills, the Treasury halts the swarm.
-- **Agents** — id, role, strategy, status (`active` / `probation` /
-  `quarantined` / `terminated`), realised net cash flow, survival verdict
-  (`PASS` / `PROBATION` / `TERMINATE` / `IMMATURE`, or `EXEMPT` for the
-  Treasury), crash count and holdings.
+- **Agents** — id, status (`active` / `probation` / `quarantined` /
+  `terminated`), realised net cash flow, survival verdict, role, strategy, crash
+  count and holdings. Hover or tap a verdict for the Treasury's reason.
+
+  The verdicts are:
+
+  | Verdict | Meaning |
+  | --- | --- |
+  | `PASS` | judged, and it cleared `ARES_MIN_NET` in the window |
+  | `PROBATION` | judged, and it failed a mature window; one more and it is out |
+  | `TERMINATE` | judged, and the Treasury has ended it |
+  | `IMMATURE` | **too early**: the window has not closed, or there are fewer than `ARES_MIN_SAMPLES` outcomes |
+  | `EXEMPT` | the Treasury does not judge itself |
+  | `UNJUDGED` | **no verdict has been recorded at all** |
+
+  `UNJUDGED` is the one to be careful with. It is shown before the first window
+  closes — and it is shown *forever* if no Treasury is wired to do the judging.
+  It does not mean "fine so far"; it means nobody has looked. If every agent
+  reads `UNJUDGED` after several windows, check that a treasury agent is running
+  before you read the run as healthy.
 - **Bus** and its **drop counts by reason** (`max_hops`, `queue_full`,
   `loop_guard`, `closed`). Anything but zero here is worth reading the logs over.
 - **Policy** — allowed/denied totals and denials by rule.
-- **Recent ledger** — the newest entries with their legs, which always sum to zero.
+- **Recent ledger** — the newest entries with their legs, which always sum to
+  zero. Leg amounts are shown in the same units as the Cash tile (`cash +SAR
+  125.00`, not `cash +12500`): they used to be printed as raw minor units beside
+  a Cash tile in riyals, a 100x misread in the exact panel used to reconstruct a
+  loss.
+- **Ledger balances** — the account totals `/api/state` already carries.
 
 `quarantined` means the supervisor stopped ticking an agent after
 `ARES_MAX_CRASHES` failures. It is **not** termination: liquidating inventory,
@@ -269,16 +456,24 @@ money is not engineering effort but obligations this project does not discharge:
   live path exists, someone must establish which licence or registration applies
   (in Saudi Arabia, that means the relevant CMA/SAMA determination for the
   activity in question), and hold it.
-- **Terms of service, per venue, in writing.** The `ksa_ecom` adapter already
-  demonstrates the general case: a venue whose terms require human approval for
-  each purchase cannot be traded by an autonomous agent, whatever the code can
-  do. Each venue needs an explicit, current, human-read authorisation for
+- **Terms of service, per venue, in writing.** The `ksa_ecom` adapter
+  demonstrates the general case and also the limit of what this repository
+  knows: its ToS note is an **unverified generalisation**. It names no platform,
+  cites no clause and carries no date, and it is labelled as such in the code.
+  Nor is the selling side unconditional — merchant APIs typically require an
+  approved account and a named human operator, impose rate limits and
+  listing-content rules, and some programmes prohibit automated repricing
+  outright. Each venue needs an explicit, current, human-read authorisation for
   automated access — an API key is not permission.
 - **KYC/AML and sanctions screening** on counterparties and on the funding
   source, with records an auditor can inspect.
 - **Tax treatment** decided in advance: VAT on Saudi e-commerce sales, income and
   withholding treatment of the proceeds, and the invoicing (ZATCA e-invoicing)
-  that goes with them.
+  that goes with them. The VAT rate in `ksa_ecom` is a **configuration
+  parameter** (`params.vatRateBps`) labelled in code as an assumption pending
+  legal review. Nothing here asserts a statutory rate. The simulator does now
+  *deduct* it in the fill path rather than merely display it, which is the
+  arithmetic being right, not the rate being confirmed.
 - **A human accountable for the money.** Every governance control here — the
   drawdown brake, the kill switch, the per-trade cap — is designed to make an
   autonomous process *fail safe*, not to make it *unsupervised*. A live system

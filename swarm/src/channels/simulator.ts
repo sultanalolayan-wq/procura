@@ -63,6 +63,25 @@ export interface ChannelParams {
   sellCommissionBps: number;
   /** Flat fee charged the moment a listing is published, sold or not. */
   listingFeeMinor: Minor;
+  /**
+   * Last-mile / delivery cost, charged ONCE PER ORDER on every fill. This is the
+   * shipping label. On a physical channel it dominates everything else at this
+   * price band, which is precisely why it must not be omitted.
+   */
+  fulfilmentPerOrderMinor: Minor;
+  /** Pick, pack and consumables, charged PER UNIT on every fill. */
+  packagingPerUnitMinor: Minor;
+  /** Payment-processor cost on the gross, in bps. */
+  paymentFeeBps: number;
+  /** Payment-processor flat cost per order, in minor units. */
+  paymentFeeFlatMinor: Minor;
+  /**
+   * Fixed platform/seller-account overhead accrued EVERY TICK for as long as the
+   * channel is registered, whether or not anything is listed or sold. Accrues
+   * per tick and is collected the next time the swarm transacts on the channel
+   * (a listing or a settled fill), the way a monthly seller-account bill is.
+   */
+  platformFeePerTickMinor: Minor;
   /** Ticks between a sale happening and the cash being reportable. */
   settlementDelayTicks: number;
   /** Probability that a fill (buy or sell) is partial rather than complete. */
@@ -71,11 +90,32 @@ export interface ChannelParams {
   baseSellThrough: number;
   /** Demand-curve elasticity: how fast sell-through decays above latent value. */
   elasticity: number;
-  /** Probability that a listing is simply dead and never sells within its TTL. */
+  /**
+   * Fraction of the ASSORTMENT that is permanently dead. Drawn ONCE PER SKU at
+   * channel registration, never per listing: a dud SKU stays a dud however many
+   * times it is relisted. Drawing it per listing would teach "relist and it will
+   * eventually sell", which is the opposite of the real lesson.
+   */
   deadListingProb: number;
   /** Default TTL applied to a published offer when the caller supplies none. */
   listingTtlTicks: number;
-  /** VAT rate, in bps, used only for the display convention (see ksa_ecom). */
+  /**
+   * Permanent per-tick decay of a SKU's long-run mean, in bps. NEGATIVE drift on
+   * purpose: without it the OU process guarantees that anything bought below the
+   * mean recovers given enough time, so holding is free optionality and "wait it
+   * out" strictly dominates selling. Inventory must age.
+   */
+  valueDriftBps: number;
+  /** Per-tick probability that a SKU's value collapses permanently (obsolescence). */
+  obsolescenceProb: number;
+  /** Multiplier applied to a SKU's mean AND spot value when it collapses. */
+  obsolescenceFactor: number;
+  /**
+   * VAT rate, in bps. CONFIGURABLE ASSUMPTION, NOT A STATEMENT OF LAW (see
+   * ksa_ecom.ts). It drives both the VAT-inclusive display convention and the
+   * deduction in the fill path: VAT collected on a sale is money owed to the tax
+   * authority, never the seller's margin.
+   */
   vatRateBps: number;
 }
 
@@ -101,12 +141,20 @@ export const BASE_PARAMS: ChannelParams = {
   buyCommissionBps: 200,
   sellCommissionBps: 600,
   listingFeeMinor: 25,
-  settlementDelayTicks: 2,
+  fulfilmentPerOrderMinor: 0,
+  packagingPerUnitMinor: 0,
+  paymentFeeBps: 250,
+  paymentFeeFlatMinor: 100,
+  platformFeePerTickMinor: 0,
+  settlementDelayTicks: 20,
   partialFillProb: 0.18,
   baseSellThrough: 0.35,
   elasticity: 2.8,
   deadListingProb: 0.2,
   listingTtlTicks: 12,
+  valueDriftBps: -15,
+  obsolescenceProb: 0.003,
+  obsolescenceFactor: 0.35,
   vatRateBps: 0,
 };
 
@@ -133,13 +181,27 @@ export const DEFAULT_CHANNEL_PARAMS: Readonly<Record<string, Partial<ChannelPara
     opportunityTtlTicks: 6,
     buyCommissionBps: 0,
     sellCommissionBps: 900,
-    listingFeeMinor: 0,
-    settlementDelayTicks: 2,
+    // An unsold listing MUST be a real loss. At zero this channel was
+    // structurally incapable of losing money: with unitCost 0, listingFee 0 and
+    // buyCommission 0 the seller's floor rule reduced to "price >= 9% of price",
+    // which is true for every price.
+    listingFeeMinor: 120,
+    // No shipping, but delivery/hosting/support per order is not free.
+    fulfilmentPerOrderMinor: 150,
+    packagingPerUnitMinor: 0,
+    paymentFeeBps: 275,
+    paymentFeeFlatMinor: 100,
+    platformFeePerTickMinor: 18,
+    settlementDelayTicks: 20,
     partialFillProb: 0.1,
     baseSellThrough: 0.18, // low and slow: revenue must come from pricing, not volume
     elasticity: 2.0,
     deadListingProb: 0.3,
     listingTtlTicks: 16,
+    // Data goes stale fast, and a dataset can be superseded outright.
+    valueDriftBps: -30,
+    obsolescenceProb: 0.005,
+    obsolescenceFactor: 0.3,
   },
   digitalassets: {
     skuCount: 32,
@@ -157,12 +219,22 @@ export const DEFAULT_CHANNEL_PARAMS: Readonly<Record<string, Partial<ChannelPara
     buyCommissionBps: 250,
     sellCommissionBps: 250,
     listingFeeMinor: 25,
-    settlementDelayTicks: 5, // long settlement: cash is locked up for a while
+    fulfilmentPerOrderMinor: 0, // transferable: nothing is shipped
+    packagingPerUnitMinor: 0,
+    paymentFeeBps: 250,
+    paymentFeeFlatMinor: 75,
+    platformFeePerTickMinor: 14,
+    // Cash conversion is 90-150 days in the real thing. The old value of 5 was
+    // off by roughly 10x and let a naive strategy recycle capital far too fast.
+    settlementDelayTicks: 45,
     partialFillProb: 0.22,
     baseSellThrough: 0.45,
     elasticity: 3.4,
     deadListingProb: 0.18,
     listingTtlTicks: 10,
+    valueDriftBps: -15,
+    obsolescenceProb: 0.003,
+    obsolescenceFactor: 0.4,
   },
   ksa_ecom: {
     currency: 'SAR',
@@ -180,12 +252,24 @@ export const DEFAULT_CHANNEL_PARAMS: Readonly<Record<string, Partial<ChannelPara
     buyCommissionBps: 300,
     sellCommissionBps: 850,
     listingFeeMinor: 100,
-    settlementDelayTicks: 3,
+    // THE SHIPPING LABEL. At this channel's SAR 32-65 price band a real KSA
+    // per-order cost is last-mile SAR 15-30, pick/pack SAR 2-5 and payment
+    // ~2-2.75% + ~SAR 1 — together 40-70% of order value. Omitting it was the
+    // single largest overstatement in the model.
+    fulfilmentPerOrderMinor: 2_000,
+    packagingPerUnitMinor: 300,
+    paymentFeeBps: 250,
+    paymentFeeFlatMinor: 100,
+    platformFeePerTickMinor: 22,
+    settlementDelayTicks: 30,
     partialFillProb: 0.2,
     baseSellThrough: 0.38,
     elasticity: 2.6,
     deadListingProb: 0.22,
     listingTtlTicks: 14,
+    valueDriftBps: -20,
+    obsolescenceProb: 0.0035,
+    obsolescenceFactor: 0.35,
     // ASSUMPTION, NOT VERIFIED LAW: the standard KSA VAT rate used for the
     // VAT-inclusive display convention. Configurable on purpose — it must be
     // confirmed by the legal reviewer before anyone relies on it.
@@ -201,6 +285,38 @@ export function resolveParams(channel: string, overrides: Partial<ChannelParams>
     // A zero-tick settlement would let a naive strategy recycle cash instantly,
     // which is exactly the unrealistic behaviour this simulator exists to deny.
     throw new AresError('SIM_BAD_PARAMS', `settlementDelayTicks must be >= 1 for ${channel}`);
+  }
+  // A VAT rate outside [0, 100%] is not a tax rate. -10000 in particular made
+  // vatBreakdown() divide by zero, and any negative rate turns tax into revenue.
+  if (!Number.isFinite(p.vatRateBps) || p.vatRateBps < 0 || p.vatRateBps > 10_000) {
+    throw new AresError(
+      'SIM_BAD_PARAMS',
+      `vatRateBps must be between 0 and 10000 for ${channel}, got ${String(p.vatRateBps)}`,
+    );
+  }
+  for (const k of [
+    'listingFeeMinor',
+    'fulfilmentPerOrderMinor',
+    'packagingPerUnitMinor',
+    'paymentFeeFlatMinor',
+    'platformFeePerTickMinor',
+  ] as const) {
+    const v = p[k];
+    if (!Number.isSafeInteger(v) || v < 0) {
+      throw new AresError('SIM_BAD_PARAMS', `${k} must be a non-negative integer for ${channel}, got ${String(v)}`);
+    }
+  }
+  if (!Number.isFinite(p.paymentFeeBps) || p.paymentFeeBps < 0) {
+    throw new AresError('SIM_BAD_PARAMS', `paymentFeeBps must be >= 0 for ${channel}`);
+  }
+  if (!(p.obsolescenceProb >= 0 && p.obsolescenceProb <= 1)) {
+    throw new AresError('SIM_BAD_PARAMS', `obsolescenceProb must be in [0,1] for ${channel}`);
+  }
+  if (!(p.obsolescenceFactor >= 0 && p.obsolescenceFactor <= 1)) {
+    throw new AresError('SIM_BAD_PARAMS', `obsolescenceFactor must be in [0,1] for ${channel}`);
+  }
+  if (!(p.deadListingProb >= 0 && p.deadListingProb <= 1)) {
+    throw new AresError('SIM_BAD_PARAMS', `deadListingProb must be in [0,1] for ${channel}`);
   }
   return Object.freeze(p);
 }
@@ -226,6 +342,32 @@ export interface SimListing {
   genuineBargain: boolean;
 }
 
+/**
+ * Everything deducted from the gross of one order, itemised. `feeMinor` on the
+ * fill is the sum, so a caller that only knows about "fees" still pays all of it
+ * — but an auditor can see WHICH cost killed the margin.
+ */
+export interface FillCosts {
+  /** Marketplace commission on the gross. */
+  commissionMinor: Minor;
+  /** Last-mile delivery, once per order. */
+  fulfilmentMinor: Minor;
+  /** Pick/pack, per unit. */
+  packagingMinor: Minor;
+  /** Payment processing: bps of gross plus a flat per-order charge. */
+  paymentMinor: Minor;
+  /** Fixed platform overhead accrued since it was last collected. */
+  platformMinor: Minor;
+  /** VAT collected from the buyer inside the gross. Owed to the tax authority. */
+  vatMinor: Minor;
+  /** VAT charged BY the platform/carrier ON their fees. A real cost to the seller. */
+  vatOnFeesMinor: Minor;
+  /** commission + fulfilment + packaging + payment + platform (VAT excluded). */
+  sellerCostMinor: Minor;
+  /** sellerCost + vat + vatOnFees. Equals the fill's feeMinor exactly. */
+  totalMinor: Minor;
+}
+
 export interface SimFill {
   channel: string;
   offerId: string;
@@ -233,6 +375,8 @@ export interface SimFill {
   qty: number;
   unitPriceMinor: Minor;
   feeMinor: Minor;
+  /** Itemised breakdown of feeMinor. */
+  costs: FillCosts;
   soldTick: number;
   settleTick: number;
 }
@@ -255,6 +399,16 @@ export interface SimCounters {
   feesMinor: Minor;
   buys: number;
   boughtUnits: number;
+  /** Platform overhead ACCRUED, whether or not it has been collected yet. */
+  platformAccruedMinor: Minor;
+  /** Platform overhead actually charged to the swarm. */
+  platformChargedMinor: Minor;
+  /** VAT collected from buyers. Owed onward; never the seller's margin. */
+  vatCollectedMinor: Minor;
+  /** Fulfilment + packaging charged across every fill. */
+  logisticsMinor: Minor;
+  /** Number of SKUs written down by an obsolescence event. */
+  obsoleted: number;
 }
 
 interface SkuState {
@@ -263,6 +417,13 @@ interface SkuState {
   meanMinor: number;
   valueMinor: number;
   demand: number;
+  /**
+   * PERMANENT. Drawn once, at registration: this SKU is part of the dead tail of
+   * the assortment and will never sell, however often it is relisted.
+   */
+  dead: boolean;
+  /** True once this SKU has been written down by an obsolescence event. */
+  obsolete: boolean;
 }
 
 interface ActiveListing {
@@ -288,6 +449,8 @@ interface ChannelState {
   expiries: SimExpiry[];
   counters: SimCounters;
   seq: number;
+  /** Platform overhead accrued since it was last collected, in minor units. */
+  platformAccrualMinor: Minor;
 }
 
 export interface MarketDeps {
@@ -310,6 +473,52 @@ export function feeOnBps(amountMinor: Minor, bps: number): Minor {
 
 function clamp(x: number, lo: number, hi: number): number {
   return x < lo ? lo : x > hi ? hi : x;
+}
+
+/**
+ * Net the VAT out of a VAT-INCLUSIVE gross. Integer math; the VAT component is
+ * whatever is left after the net, so net + vat reconstructs the gross exactly.
+ * The rate is a CONFIGURABLE ASSUMPTION (see ksa_ecom.ts), never a legal claim.
+ */
+export function vatOnGross(grossMinor: Minor, vatRateBps: number): Minor {
+  if (vatRateBps <= 0) return 0;
+  const net = Math.round((grossMinor * 10_000) / (10_000 + vatRateBps));
+  return grossMinor - net;
+}
+
+/**
+ * Every cost of one order, itemised. Pure, integer, and deliberately charged in
+ * full: the swarm used to book the money it owes the tax authority as profit and
+ * to ship at no cost at all.
+ */
+export function fillCosts(
+  p: ChannelParams,
+  grossMinor: Minor,
+  qty: number,
+  platformDueMinor: Minor = 0,
+): FillCosts {
+  const commissionMinor = feeOnBps(grossMinor, p.sellCommissionBps);
+  const fulfilmentMinor = p.fulfilmentPerOrderMinor;
+  const packagingMinor = p.packagingPerUnitMinor * Math.max(0, qty);
+  const paymentMinor = feeOnBps(grossMinor, p.paymentFeeBps) + p.paymentFeeFlatMinor;
+  const platformMinor = Math.max(0, platformDueMinor);
+  const sellerCostMinor = commissionMinor + fulfilmentMinor + packagingMinor + paymentMinor + platformMinor;
+  // VAT collected from the buyer inside a VAT-inclusive price is NOT margin.
+  const vatMinor = vatOnGross(grossMinor, p.vatRateBps);
+  // ...and the platform/carrier/PSP charge VAT on their own fees, which the
+  // seller pays. Hence proceeds = gross - vat - fees * (1 + vatRate).
+  const vatOnFeesMinor = feeOnBps(sellerCostMinor, p.vatRateBps);
+  return {
+    commissionMinor,
+    fulfilmentMinor,
+    packagingMinor,
+    paymentMinor,
+    platformMinor,
+    vatMinor,
+    vatOnFeesMinor,
+    sellerCostMinor,
+    totalMinor: sellerCostMinor + vatMinor + vatOnFeesMinor,
+  };
 }
 
 /* ------------------------------------------------------------- MarketSimulator */
@@ -360,12 +569,18 @@ export class MarketSimulator {
     for (let i = 0; i < params.skuCount; i++) {
       const spread = 1 + (marketRng.next() * 2 - 1) * params.valueDispersion;
       const meanMinor = Math.max(1, params.baseValueMinor * spread);
+      // The dead draw happens HERE, once, per SKU — not per listing. A fixed
+      // fraction of the assortment is permanently unsellable, so relisting a dud
+      // is throwing good listing fees after bad rather than a route to a sale.
+      const dead = marketRng.next() < params.deadListingProb;
       skus.push({
         sku: `${name}-sku-${String(i).padStart(3, '0')}`,
         title: `${name} item ${String(i).padStart(3, '0')}`,
         meanMinor,
         valueMinor: meanMinor,
         demand: 1,
+        dead,
+        obsolete: false,
       });
     }
     const st: ChannelState = {
@@ -379,11 +594,30 @@ export class MarketSimulator {
       active: new Map(),
       pending: [],
       expiries: [],
-      counters: { listed: 0, filled: 0, expired: 0, feesMinor: 0, buys: 0, boughtUnits: 0 },
+      counters: {
+        listed: 0,
+        filled: 0,
+        expired: 0,
+        feesMinor: 0,
+        buys: 0,
+        boughtUnits: 0,
+        platformAccruedMinor: 0,
+        platformChargedMinor: 0,
+        vatCollectedMinor: 0,
+        logisticsMinor: 0,
+        obsoleted: 0,
+      },
       seq: 0,
+      platformAccrualMinor: 0,
     };
     this.channels.set(name, st);
-    this.logger.debug('channel registered', { channel: name, marketSeed, execSeed, skuCount: params.skuCount });
+    this.logger.debug('channel registered', {
+      channel: name,
+      marketSeed,
+      execSeed,
+      skuCount: params.skuCount,
+      deadSkus: skus.filter((k) => k.dead).length,
+    });
     return params;
   }
 
@@ -414,10 +648,33 @@ export class MarketSimulator {
     // 1. latent value: mean-reverting (OU) random walk; demand: slow seasonal + noise.
     const season = 1 + p.seasonAmplitude * Math.sin((2 * Math.PI * tick) / Math.max(1, p.seasonPeriodTicks));
     for (const s of st.skus) {
+      // OBSOLESCENCE, part 1: the long-run mean itself decays. Without this the
+      // OU pull guarantees that anything bought below the mean recovers if you
+      // wait, so holding costs nothing and "wait it out" strictly dominates.
+      if (p.valueDriftBps !== 0) {
+        s.meanMinor = Math.max(1, s.meanMinor * (1 + p.valueDriftBps / 10_000));
+      }
+      // OBSOLESCENCE, part 2: a small per-tick chance the SKU is superseded and
+      // never comes back. PERMANENT — the mean moves, not just the spot value.
+      if (p.obsolescenceProb > 0 && r.next() < p.obsolescenceProb) {
+        s.meanMinor = Math.max(1, s.meanMinor * p.obsolescenceFactor);
+        s.valueMinor = Math.max(1, s.valueMinor * p.obsolescenceFactor);
+        if (!s.obsolete) {
+          s.obsolete = true;
+          st.counters.obsoleted += 1;
+        }
+        this.logger.debug('sku obsoleted', { channel: st.name, sku: s.sku, tick, factor: p.obsolescenceFactor });
+      }
       const drift = p.ouTheta * (s.meanMinor - s.valueMinor);
       const shock = r.gauss(0, p.ouSigma * s.meanMinor);
       s.valueMinor = Math.max(1, s.valueMinor + drift + shock);
       s.demand = Math.max(0.05, season * (1 + r.gauss(0, p.demandNoiseSigma)));
+    }
+    // Fixed platform overhead accrues every tick the channel is registered,
+    // whether or not the swarm lists or sells anything on it.
+    if (p.platformFeePerTickMinor > 0) {
+      st.platformAccrualMinor += p.platformFeePerTickMinor;
+      st.counters.platformAccruedMinor += p.platformFeePerTickMinor;
     }
     // 2. surface this tick's listings.
     st.pool = this.mintListings(st, tick);
@@ -470,7 +727,7 @@ export class MarketSimulator {
     const r = st.execRng;
     for (const [id, l] of [...st.active.entries()]) {
       if (l.listedTick >= tick) continue; // published this tick: cannot sell yet
-      if (!l.dead && l.remaining > 0) {
+      if (!l.dead && !this.skuOf(st, l.sku).dead && l.remaining > 0) {
         const life = Math.max(1, l.expiresTick - l.listedTick);
         const pTtl = this.sellThroughRaw(st, l.sku, l.priceMinor);
         const hazard = 1 - Math.pow(1 - clamp(pTtl, 0, 0.98), 1 / life);
@@ -478,9 +735,13 @@ export class MarketSimulator {
           let qty = l.remaining;
           if (l.remaining > 1 && r.next() < p.partialFillProb) qty = 1 + r.int(l.remaining - 1);
           l.remaining -= qty;
-          const feeMinor = feeOnBps(l.priceMinor * qty, p.sellCommissionBps);
+          const grossMinor = l.priceMinor * qty;
+          const costs = fillCosts(p, grossMinor, qty, this.drainPlatformAccrual(st));
+          const feeMinor = costs.totalMinor;
           st.counters.filled += qty;
           st.counters.feesMinor += feeMinor;
+          st.counters.vatCollectedMinor += costs.vatMinor;
+          st.counters.logisticsMinor += costs.fulfilmentMinor + costs.packagingMinor;
           st.pending.push({
             channel: st.name,
             offerId: l.offerId,
@@ -488,6 +749,7 @@ export class MarketSimulator {
             qty,
             unitPriceMinor: l.priceMinor,
             feeMinor,
+            costs,
             soldTick: tick,
             settleTick: tick + p.settlementDelayTicks,
           });
@@ -590,7 +852,7 @@ export class MarketSimulator {
     qty: number,
     tick: number,
     ttlTicks?: number,
-  ): { feeMinor: Minor; dead: boolean; expiresTick: number } {
+  ): { feeMinor: Minor; platformChargeMinor: Minor; dead: boolean; expiresTick: number } {
     this.advanceTo(tick);
     const st = this.state(channel);
     if (!Number.isInteger(qty) || qty < 1) {
@@ -603,12 +865,40 @@ export class MarketSimulator {
       throw new AdapterError('SIM_DUPLICATE_LISTING', `listOffer: ${offerId} is already listed on ${channel}`);
     }
     const ttl = Number.isInteger(ttlTicks) && (ttlTicks as number) > 0 ? (ttlTicks as number) : st.params.listingTtlTicks;
-    const dead = st.execRng.next() < st.params.deadListingProb;
+    // Deadness is a property of the SKU, fixed at registration — NOT redrawn per
+    // listing. Relisting a dud does not give it a fresh 1-in-5 chance.
+    const dead = this.skuOf(st, sku).dead;
     const expiresTick = tick + ttl;
     st.active.set(offerId, { offerId, sku, priceMinor, remaining: qty, listedTick: tick, expiresTick, dead });
     st.counters.listed += 1;
     st.counters.feesMinor += st.params.listingFeeMinor;
-    return { feeMinor: st.params.listingFeeMinor, dead, expiresTick };
+    // Overhead accrued since the last transaction falls due now.
+    const platformChargeMinor = this.drainPlatformAccrual(st);
+    return { feeMinor: st.params.listingFeeMinor, platformChargeMinor, dead, expiresTick };
+  }
+
+  /**
+   * Collect the platform overhead accrued since it was last collected. Returns
+   * the amount and resets the accrual — so overhead is charged exactly once,
+   * whichever transaction happens to be the one that collects it.
+   */
+  private drainPlatformAccrual(st: ChannelState): Minor {
+    const due = st.platformAccrualMinor;
+    if (due <= 0) return 0;
+    st.platformAccrualMinor = 0;
+    st.counters.platformChargedMinor += due;
+    st.counters.feesMinor += due;
+    return due;
+  }
+
+  /** Platform overhead accrued on a channel but not yet collected. */
+  platformAccrual(channel: string): Minor {
+    return this.state(channel).platformAccrualMinor;
+  }
+
+  /** Whether a SKU is part of this channel's permanently dead tail. */
+  isDeadSku(channel: string, sku: string): boolean {
+    return this.skuOf(this.state(channel), sku).dead;
   }
 
   /** Settled fills at or before `tick`. Draining: a second call returns []. */
@@ -653,14 +943,21 @@ export class MarketSimulator {
 
   counters(channel?: string): SimCounters {
     if (channel !== undefined) return { ...this.state(channel).counters };
-    const total: SimCounters = { listed: 0, filled: 0, expired: 0, feesMinor: 0, buys: 0, boughtUnits: 0 };
+    const total: SimCounters = {
+      listed: 0,
+      filled: 0,
+      expired: 0,
+      feesMinor: 0,
+      buys: 0,
+      boughtUnits: 0,
+      platformAccruedMinor: 0,
+      platformChargedMinor: 0,
+      vatCollectedMinor: 0,
+      logisticsMinor: 0,
+      obsoleted: 0,
+    };
     for (const st of this.channels.values()) {
-      total.listed += st.counters.listed;
-      total.filled += st.counters.filled;
-      total.expired += st.counters.expired;
-      total.feesMinor += st.counters.feesMinor;
-      total.buys += st.counters.buys;
-      total.boughtUnits += st.counters.boughtUnits;
+      for (const k of Object.keys(total) as (keyof SimCounters)[]) total[k] += st.counters[k];
     }
     return total;
   }
@@ -812,7 +1109,7 @@ export abstract class SimulatedChannelAdapter implements ChannelAdapter {
       return prior;
     }
     const offerId = `${this.name}:${offer.id}`;
-    const { feeMinor } = this.sim.listOffer(
+    const listed = this.sim.listOffer(
       this.name,
       offerId,
       offer.sku,
@@ -821,7 +1118,13 @@ export abstract class SimulatedChannelAdapter implements ChannelAdapter {
       tick,
       typeof offer.meta['ttlTicks'] === 'number' ? (offer.meta['ttlTicks'] as number) : undefined,
     );
+    // The listing fee AND any platform overhead that has fallen due are both
+    // real cash leaving now, sale or no sale, so both are in the fee the caller
+    // books. The split is surfaced in meta for the audit trail.
+    const feeMinor = listed.feeMinor + listed.platformChargeMinor;
     this.decorateListing(offer, offerId, tick);
+    offer.meta['listingFeeMinor'] = listed.feeMinor;
+    offer.meta['platformChargeMinor'] = listed.platformChargeMinor;
     const result = { offerId, feeMinor };
     this.publishIdem.set(idem, result);
     return result;

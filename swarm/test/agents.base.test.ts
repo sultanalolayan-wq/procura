@@ -14,6 +14,7 @@ import { nullLogger } from '../src/core/logger.js';
 import { PolicyEngine } from '../src/governance/policy.js';
 import { KillSwitch } from '../src/governance/killswitch.js';
 import {
+  ACTION_TOKENS,
   BaseAgent,
   assertPolicyWired,
   makeAgentDeps,
@@ -415,6 +416,90 @@ test('an agent registers itself with the budget governor exactly once', async ()
     // A second agent on the same id must not double-register (which throws).
     assert.doesNotThrow(() => new ProbeAgent('scout-reg', deps));
     assert.equal(a.id, 'scout-reg');
+  } finally {
+    s.close();
+  }
+});
+
+/* ============ AMENDMENT A9: the compute budget must actually be charged ===== */
+
+test('A9: every act() charges a modelled compute cost to the ledger', async () => {
+  // Before this, chargeTokens() had NO caller anywhere: balanceOf('compute') was
+  // permanently 0, so ANY gross trading margin read as profit and the survival
+  // rule could never see the cost of running the swarm at all.
+  const s = await makeStack({ ARES_MAX_ACTIONS: '3' });
+  try {
+    assert.equal(s.ledger.balanceOf('compute'), 0, 'nothing has run yet');
+    const cashBefore = s.ledger.balanceOf('cash');
+
+    const a = new ProbeAgent('scout-compute', s.depsFor('scout-compute'));
+    a.plan = async (self) => {
+      for (let i = 0; i < 3; i++) await self.doAct(`step-${i}`, async () => i);
+    };
+    await a.runTick(0);
+    await a.runTick(1);
+
+    const spends = s.ledger.entries({ type: 'TOKEN_SPEND', agentId: 'scout-compute' });
+    // Accrued per action, BOOKED once per tick: six actions over two ticks is two
+    // entries of three actions each. One entry per action would have made compute
+    // ~96% of every ledger entry in a run, on a chain that never rotates.
+    assert.equal(spends.length, 2, 'one entry per agent per tick');
+    assert.deepEqual(spends.map((e) => e.tick), [0, 1]);
+    for (const e of spends) {
+      assert.deepEqual(e.legs.map((l) => l.account), ['compute', 'cash']);
+      assert.equal(e.legs.reduce((x, l) => x + l.amount, 0), 0, 'a charge is a balanced double entry');
+      assert.equal(e.meta['tokens'], ACTION_TOKENS * 3, 'the whole tick worth of actions, in one entry');
+    }
+    assert.ok(s.ledger.balanceOf('compute') > 0, 'the compute account is real now');
+    assert.equal(
+      s.ledger.balanceOf('compute'),
+      cashBefore - s.ledger.balanceOf('cash'),
+      'every halala of compute came out of cash',
+    );
+    assert.equal(a.snapshot().tokensCharged, ACTION_TOKENS * 6);
+    assert.ok(s.budget.snapshot().tokens.used >= ACTION_TOKENS * 6, 'and the token governor saw it');
+    assert.equal(s.ledger.verify().ok, true);
+  } finally {
+    s.close();
+  }
+});
+
+test('A9: the per-agent token cap is load-bearing: an exhausted agent is refused', async () => {
+  // ARES_AGENT_TOKEN_CAP advertised a brake that nothing was connected to.
+  const s = await makeStack({ ARES_MAX_ACTIONS: '8', ARES_AGENT_TOKEN_CAP: '2500', ARES_TOKEN_CAP: '5000' });
+  try {
+    const a = new ProbeAgent('scout-capped', s.depsFor('scout-capped'));
+    const ran: number[] = [];
+    a.plan = async (self) => {
+      for (let i = 0; i < 8; i++) {
+        const r = await self.doAct(`step-${i}`, async () => {
+          ran.push(i);
+          return i;
+        });
+        if (r === null) break;
+      }
+    };
+    await a.runTick(0);
+
+    assert.deepEqual(ran, [0, 1], 'two actions at 1,000 modelled tokens each, then the cap bites');
+    assert.equal(a.snapshot().tokenRefusals, 1);
+    assert.equal(a.snapshot().crashes, 0, 'running out of budget is a refusal, not a crash');
+    assert.equal(s.budget.availableTokens('scout-capped'), 500, 'and the remainder is visibly short');
+  } finally {
+    s.close();
+  }
+});
+
+test('A9: the charge is skippable, deliberately and auditably', async () => {
+  const s = await makeStack();
+  try {
+    const a = new ProbeAgent('scout-free', { ...s.depsFor('scout-free'), tokensPerAction: 0 });
+    a.plan = async (self) => {
+      await self.doAct('one', async () => 1);
+    };
+    await a.runTick(0);
+    assert.equal(s.ledger.entries({ type: 'TOKEN_SPEND', agentId: 'scout-free' }).length, 0);
+    assert.equal(a.snapshot().tokensCharged, 0);
   } finally {
     s.close();
   }

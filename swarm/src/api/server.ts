@@ -6,6 +6,11 @@
  * no response body ever contains a stack trace, a config value, a token or a
  * file path; /api/ledger?limit= is clamped so one request cannot serialise weeks
  * of ledger into memory; halt is irreversible and says so.
+ * When a token is configured it is required on EVERY /api/* route and on
+ * /metrics, not only on the mutating one (/healthz stays open for the container
+ * healthcheck). No route performs unbounded work: the verification verdict is
+ * read from the ledger's last check rather than recomputed, because re-hashing
+ * the chain on the request thread is a remote halt primitive.
  * Callers: runtime/orchestrator, src/index.ts, tests.
  */
 
@@ -37,6 +42,20 @@ export const MAX_BODY_BYTES = 4096;
 
 /** Entries embedded in /api/state for the dashboard's ledger panel. */
 export const STATE_LEDGER_ROWS = 25;
+
+/** Consecutive failed halt authentications before the route locks out. */
+export const AUTH_LOCKOUT_AFTER = 5;
+
+/** How long the halt route stays locked out, on the injected clock. */
+export const AUTH_LOCKOUT_MS = 60_000;
+
+/**
+ * Routes that answer without a bearer token even when one is configured:
+ * the two container probes (a healthcheck has no credential to present) and
+ * the static dashboard shell, which carries no swarm data of its own and gets
+ * all of it from the gated /api/* routes.
+ */
+const PUBLIC_ROUTES: ReadonlySet<string> = new Set(['/healthz', '/readyz', '/', '/dashboard.js']);
 
 export interface ApiDeps {
   cfg: AresConfig;
@@ -129,9 +148,13 @@ function clampLimit(raw: string | null): number {
   return i;
 }
 
-/** Prometheus label values: escape backslash, quote and newline. Nothing else. */
+/** Prometheus label values: escape backslash, quote, newline and carriage return. */
 function lbl(v: unknown): string {
-  return String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+  return String(v)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r');
 }
 
 function metricNum(v: unknown): string {
@@ -165,6 +188,10 @@ export class ApiServer {
   private requests = 0;
   private haltRequests = 0;
   private authFailures = 0;
+  private consecutiveAuthFailures = 0;
+  private lockedOutUntil = 0;
+  private lockouts = 0;
+  private unauthorizedReads = 0;
 
   constructor(deps: ApiDeps) {
     this.deps = deps;
@@ -250,6 +277,42 @@ export class ApiServer {
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     this.requests += 1;
+    // Whatever this handler spends on the shared event loop is NOT the
+    // supervisor's tick work. Declaring it here is what stops a burst of
+    // requests from pushing the tick watchdog over its threshold and latching
+    // the emergency stop from outside, with no credential presented.
+    const handlerStart = this.deps.clock.now();
+    try {
+      await this.route(req, res);
+    } finally {
+      const spent = this.deps.clock.now() - handlerStart;
+      if (spent > 0) {
+        try {
+          this.deps.supervisor.noteExternalBlocking(spent);
+        } catch {
+          /* observability must never fail a request */
+        }
+      }
+    }
+  }
+
+  /**
+   * True when this request may proceed. With no token configured, reads are
+   * open (the bind refusal already guarantees loopback-only in that case). With
+   * a token configured, EVERY /api/* route and /metrics require it — the
+   * documented escape hatch "expose the port but set ARES_API_TOKEN" was false
+   * while auth was only checked inside halt(), and the Dockerfile hard-sets
+   * ARES_API_HOST=0.0.0.0, so any container on the same Docker network reached
+   * the listener directly.
+   */
+  private authorised(path: string, req: IncomingMessage): boolean {
+    const token = this.cfg.api.token;
+    if (token === null || token.length === 0) return true;
+    if (PUBLIC_ROUTES.has(path)) return true;
+    return tokenMatches(bearerOf(req), token);
+  }
+
+  private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     let path = '/';
     let query: URLSearchParams = new URLSearchParams();
     try {
@@ -275,6 +338,16 @@ export class ApiServer {
         this.json(req, res, 405, { error: 'method_not_allowed', allow: spec.methods });
         return;
       }
+      // /api/halt does its own richer refusal (lockout, "no token configured"),
+      // so the blanket read gate deliberately skips it.
+      if (path !== '/api/halt' && !this.authorised(path, req)) {
+        this.authFailures += 1;
+        this.unauthorizedReads += 1;
+        this.log.warn('api.unauthorized_read', { path, remote: req.socket.remoteAddress ?? null });
+        res.setHeader('WWW-Authenticate', 'Bearer realm="ares"');
+        this.json(req, res, 401, { error: 'unauthorized', message: 'A valid bearer token is required.' });
+        return;
+      }
       switch (path) {
         case '/':
           this.dashboard(req, res);
@@ -293,12 +366,19 @@ export class ApiServer {
           return;
         case '/readyz': {
           const sup = this.deps.supervisor.snapshot();
-          const ready = sup.running && !this.deps.killSwitch.tripped;
+          // A loop that has missed its deadline by more than a whole interval
+          // is not ready, however cheerfully `running` still reads. A crashed
+          // loop used to leave every liveness signal green.
+          const ready = sup.running && !sup.stalled && !this.deps.killSwitch.tripped;
           this.json(req, res, ready ? 200 : 503, {
             status: ready ? 'ready' : 'not_ready',
             running: sup.running,
             halted: this.deps.killSwitch.tripped,
             shuttingDown: sup.shuttingDown,
+            stalled: sup.stalled,
+            loopCrashed: sup.loopCrashed,
+            tickOverdueMs: sup.tickOverdueMs,
+            tickIntervalMs: sup.tickIntervalMs,
           });
           return;
         }
@@ -385,13 +465,57 @@ export class ApiServer {
       });
       return;
     }
-    if (!tokenMatches(bearerOf(req), this.cfg.api.token)) {
+    // A counter that is incremented and never acted on is not a control. After
+    // AUTH_LOCKOUT_AFTER consecutive failures the route refuses everything for
+    // AUTH_LOCKOUT_MS, which turns an online guessing run into a ~12-attempts-
+    // per-hour exercise against a >=32-character secret.
+    //
+    // The refusal is immediate and does NOT sleep in the handler: a delay
+    // implemented by blocking (or parking) the request would itself be an
+    // event-loop amplifier, which is precisely the class of defect that lets a
+    // stranger halt the swarm. The wait is imposed on the CLIENT, via the
+    // lockout window and Retry-After, not on the server's only thread.
+    const now = this.deps.clock.now();
+    if (now < this.lockedOutUntil) {
       this.authFailures += 1;
-      this.log.warn('api.halt_unauthorized', { remote: req.socket.remoteAddress ?? null });
-      res.setHeader('WWW-Authenticate', 'Bearer realm="ares"');
-      this.json(req, res, 401, { error: 'unauthorized', message: 'A valid bearer token is required.' });
+      const retryMs = this.lockedOutUntil - now;
+      this.log.warn('api.halt_locked_out', { remote: req.socket.remoteAddress ?? null, retryMs });
+      res.setHeader('Retry-After', String(Math.ceil(retryMs / 1000)));
+      this.json(req, res, 429, {
+        error: 'too_many_attempts',
+        retryAfterMs: retryMs,
+        message: `Too many failed authentication attempts. The halt route is locked for ${String(retryMs)}ms.`,
+      });
       return;
     }
+    if (!tokenMatches(bearerOf(req), this.cfg.api.token)) {
+      this.authFailures += 1;
+      this.consecutiveAuthFailures += 1;
+      const locked = this.consecutiveAuthFailures >= AUTH_LOCKOUT_AFTER;
+      if (locked) {
+        this.lockedOutUntil = now + AUTH_LOCKOUT_MS;
+        this.lockouts += 1;
+        this.log.error('api.halt_locked', {
+          consecutiveFailures: this.consecutiveAuthFailures,
+          lockoutMs: AUTH_LOCKOUT_MS,
+        });
+      }
+      this.log.warn('api.halt_unauthorized', {
+        remote: req.socket.remoteAddress ?? null,
+        consecutiveFailures: this.consecutiveAuthFailures,
+      });
+      res.setHeader('WWW-Authenticate', 'Bearer realm="ares"');
+      if (locked) res.setHeader('Retry-After', String(Math.ceil(AUTH_LOCKOUT_MS / 1000)));
+      this.json(req, res, locked ? 429 : 401, {
+        error: locked ? 'too_many_attempts' : 'unauthorized',
+        ...(locked ? { retryAfterMs: AUTH_LOCKOUT_MS } : {}),
+        message: locked
+          ? `Too many failed authentication attempts. The halt route is locked for ${String(AUTH_LOCKOUT_MS)}ms.`
+          : 'A valid bearer token is required.',
+      });
+      return;
+    }
+    this.consecutiveAuthFailures = 0;
 
     const already = this.deps.killSwitch.tripped;
     if (!already) this.deps.killSwitch.trip('halted by operator via API', { via: 'POST /api/halt' });
@@ -457,7 +581,10 @@ export class ApiServer {
         role: a.role,
         strategyId: a.strategyId,
         status: a.status,
-        netMinor: this.deps.ledger.netCashFlow(0, tick, a.id),
+        // agentCashTotal() is an incrementally maintained index. This used to
+        // be netCashFlow(0, tick, id), a FULL LEDGER SCAN PER AGENT on every
+        // /api/state, /api/agents, /api/report and /metrics request.
+        netMinor: this.deps.ledger.agentCashTotal(a.id),
         verdict: v?.verdict ?? 'UNJUDGED',
         verdictReason: v?.reason ?? '',
         crashes: s.crashes,
@@ -530,7 +657,16 @@ export class ApiServer {
   }
 
   report(): Record<string, unknown> {
-    const v = this.deps.ledger.verify();
+    // READ the last verdict; never compute a new one. ledger.verify() re-hashes
+    // entries on the single-threaded event loop (measured: 1.16s at 100k,
+    // 4.9s at 400k). Recomputing it per request made an unauthenticated GET —
+    // and HEAD, which did identical work and returned zero bytes — into a
+    // remote halt: the supervisor charged the stall to its tick watchdog and
+    // three consecutive overruns latched the kill switch. The verdict is
+    // refreshed by the Treasury every tick and by the full check at boot and
+    // shutdown, so it is at most one tick stale, and `verifiedAt`/`verifiedAtSeq`
+    // say exactly how stale it is.
+    const v = this.deps.ledger.lastVerification();
     const b = this.deps.budget.snapshot();
     const agents = this.agents();
     return {
@@ -543,7 +679,16 @@ export class ApiServer {
       supervisor: this.deps.supervisor.snapshot(),
       halted: this.deps.killSwitch.tripped,
       haltReason: this.deps.killSwitch.reason,
-      ledger: { verified: v.ok, brokenAtSeq: v.brokenAtSeq ?? null, entries: this.deps.ledger.size() },
+      ledger: {
+        verified: v === null ? null : v.ok,
+        brokenAtSeq: v === null ? null : v.brokenAtSeq,
+        entries: this.deps.ledger.size(),
+        verifiedAt: v === null ? null : v.at,
+        verifiedAtSeq: v === null ? null : v.atSeq,
+        verifiedFromSeq: v === null ? null : v.fromSeq,
+        verifiedFullChain: v === null ? null : v.full,
+        cached: true,
+      },
       balances: this.deps.ledger.balances(),
       cash: b.cash,
       tokens: b.tokens,
@@ -770,11 +915,25 @@ export class ApiServer {
     this.text(req, res, 200, 'application/javascript; charset=utf-8', DASHBOARD_JS);
   }
 
-  stats(): { requests: number; haltRequests: number; authFailures: number; listening: boolean; port: number } {
+  stats(): {
+    requests: number;
+    haltRequests: number;
+    authFailures: number;
+    consecutiveAuthFailures: number;
+    unauthorizedReads: number;
+    lockouts: number;
+    lockedOut: boolean;
+    listening: boolean;
+    port: number;
+  } {
     return {
       requests: this.requests,
       haltRequests: this.haltRequests,
       authFailures: this.authFailures,
+      consecutiveAuthFailures: this.consecutiveAuthFailures,
+      unauthorizedReads: this.unauthorizedReads,
+      lockouts: this.lockouts,
+      lockedOut: this.deps.clock.now() < this.lockedOutUntil,
       listening: this.listening,
       port: this.boundPort,
     };

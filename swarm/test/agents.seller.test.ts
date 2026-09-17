@@ -226,15 +226,51 @@ test('fills are keyed on the channel-scoped offerId and booked at the SETTLEMENT
   }
 });
 
-test('a fill for an offer the seller never published is refused, not invented', async () => {
+test('a fill for an offer the seller never published is BOOKED, not dropped and not invented', async () => {
+  // AMENDMENT A8c — this test was changed deliberately. It used to pin the drop
+  // as correct ("no phantom revenue"), and the drop is not correct: the channel
+  // took the money and the units are gone, so refusing to book it loses real
+  // revenue, overstates inventory and punishes the scout that picked the winner.
+  // What must NOT be invented is the COST BASIS, and that is what is asserted
+  // here: cash and revenue are exact, and no inventory or cogs leg is faked.
   const stub = new StubAdapter({ name: 'digitalassets' });
   const { s, seller } = await sellerWith({ stub, unitCostMinor: 1_000, estResaleMinor: 4_000, ttlTicks: 20 });
   try {
-    stub.fills = [{ offerId: 'digitalassets:someone-elses-offer', qty: 3, unitPrice: money(9_999, 'SAR'), feeMinor: 0, tick: 2 }];
+    const cashBefore = s.ledger.balanceOf('cash');
+    const inventoryBefore = s.ledger.balanceOf('inventory');
+    stub.fills = [{ offerId: 'digitalassets:someone-elses-offer', qty: 3, unitPrice: money(9_999, 'SAR'), feeMinor: 100, tick: 2 }];
     await seller.runTick(2);
     await s.bus.drain();
-    assert.equal(s.ledger.entries({ type: 'SALE' }).length, 0, 'no phantom revenue');
+
+    assert.equal(s.ledger.entries({ type: 'SALE' }).length, 0, 'not booked as one of this seller sales');
+    const orphans = s.ledger.entries({ type: 'ORPHAN_FILL' });
+    assert.equal(orphans.length, 1, 'booked under its own type instead');
+    const legs = orphans[0]!.legs;
+    assert.deepEqual(
+      legs.map((l) => [l.account, l.amount]),
+      [
+        ['cash', 29_897],
+        ['fees', 100],
+        ['revenue', -29_997],
+      ],
+    );
+    assert.equal(legs.reduce((a, l) => a + l.amount, 0), 0, 'balanced');
+    assert.equal(orphans[0]!.tick, 2, 'at its settlement tick');
+    assert.ok(s.ledger.balanceOf('cash') > cashBefore, 'the cash reached the books');
+    assert.equal(s.ledger.balanceOf('inventory'), inventoryBefore, 'and no cost basis was invented');
+    assert.equal(s.ledger.verify().ok, true);
+
+    // Visible in stats(), not just in one warn line nobody reads.
+    const st = seller.stats();
+    assert.equal(st.orphanFills, 1);
+    assert.equal(st.orphanUnits, 3);
+    assert.equal(st.orphanRevenueMinor, 29_897);
     assert.equal(seller.crashes, 0);
+
+    // Idempotent: the same fill replayed does not book the money twice.
+    stub.fills = [{ offerId: 'digitalassets:someone-elses-offer', qty: 3, unitPrice: money(9_999, 'SAR'), feeMinor: 100, tick: 2 }];
+    await seller.runTick(3);
+    assert.equal(s.ledger.entries({ type: 'ORPHAN_FILL' }).length, 1, 'the ledger key held');
   } finally {
     s.close();
   }
@@ -388,6 +424,272 @@ test('an unknown channel on a holding is logged, never listed somewhere else', a
     await seller.runTick(1);
     assert.equal(stub.calls['publish'], 0, 'never re-homed onto an unrelated channel');
     assert.equal(seller.crashes, 0);
+  } finally {
+    s.close();
+  }
+});
+
+/* ========== AMENDMENT A7: the floor must know what LISTING costs, too ======= */
+
+/** A stub that declares its listing fee up front, as the real adapters do. */
+class DeclaringStub extends StubAdapter {
+  readonly params: { listingFeeMinor: number; currency: 'SAR' };
+  constructor(o: { name: string; demand?: number; declaredListingFeeMinor: number; chargedListingFeeMinor?: number }) {
+    super({ name: o.name, demand: o.demand ?? 0.9, listingFeeMinor: o.chargedListingFeeMinor ?? o.declaredListingFeeMinor });
+    this.params = { listingFeeMinor: o.declaredListingFeeMinor, currency: 'SAR' };
+  }
+}
+
+test('A7: the FIRST listing on a channel is costed with the channel declared listing fee', async () => {
+  // listingFeeByChannel used to be populated only AFTER a successful publish, so
+  // the first listing on every channel priced its floor with a listing fee of
+  // zero. Here the declared fee alone is what makes the listing unprofitable.
+  const stub = new DeclaringStub({ name: 'digitalassets', declaredListingFeeMinor: 100_000 });
+  const { s, seller } = await sellerWith({ stub, unitCostMinor: 1_000, estResaleMinor: 4_000, ttlTicks: 20 });
+  try {
+    await seller.runTick(1);
+    await s.bus.drain();
+    assert.equal(stub.calls['publish'], 0, 'a listing that cannot cover its own listing fee is refused');
+    assert.equal(seller.stats().refusedBelowCost, 1);
+    assert.equal(s.of('OFFER_PUBLISHED').length, 0);
+  } finally {
+    s.close();
+  }
+});
+
+test('A7: a cheap declared listing fee still lets a profitable listing through', async () => {
+  const stub = new DeclaringStub({ name: 'digitalassets', declaredListingFeeMinor: 25 });
+  const { s, seller } = await sellerWith({ stub, unitCostMinor: 1_000, estResaleMinor: 4_000, ttlTicks: 20 });
+  try {
+    await seller.runTick(1);
+    await s.bus.drain();
+    assert.equal(stub.calls['publish'], 1, 'the fee is counted, not feared');
+    assert.equal(seller.stats().refusedBelowCost, 0);
+  } finally {
+    s.close();
+  }
+});
+
+test('A7: a respawned seller remembers what listing cost, instead of assuming zero', async () => {
+  // A channel that declares nothing but charges plenty: the only way to know is
+  // to have published once. That knowledge must survive the agent that earned it.
+  const stub = new StubAdapter({ name: 'digitalassets', demand: 0.9, listingFeeMinor: 100_000 });
+  const { s, seller } = await sellerWith({ stub, unitCostMinor: 1_000, estResaleMinor: 4_000, ttlTicks: 20 });
+  try {
+    await seller.runTick(1);
+    await s.bus.drain();
+    assert.equal(stub.calls['publish'], 1, 'generation 1 pays to find out');
+
+    // Generation 2, same memory scope, a fresh holding on the same channel.
+    const heir = new SellerAgent('seller-1', 'margin-keeper', s.depsFor('seller-1'), {
+      maxMintedHoldings: 0,
+      style: { ttlTicks: 20 },
+    });
+    s.bus.publish({
+      type: 'INVENTORY_ADDED',
+      from: 'scout-1',
+      tick: 2,
+      payload: {
+        holding: holding({ id: 'h-2', channel: 'digitalassets', unitCost: money(1_000, 'SAR'), acquiredTick: 2, meta: { estResaleValueMinor: 4_000 } }),
+        channel: 'digitalassets',
+        sku: 'sku-1',
+        qty: 1,
+        unitCostMinor: 1_000,
+        costMinor: 1_000,
+        estResaleMinor: 4_000,
+        buyerId: 'scout-1',
+        tick: 2,
+      },
+    });
+    await s.bus.drain();
+    await heir.runTick(3);
+    await s.bus.drain();
+
+    assert.equal(stub.calls['publish'], 1, 'generation 2 does not repeat the lesson at full price');
+    assert.equal(heir.stats().refusedBelowCost, 1);
+  } finally {
+    s.close();
+  }
+});
+
+/* ===== AMENDMENT A8a: a successor inherits its predecessor live listings ==== */
+
+test('A8a: a successor books the fill from a terminated predecessor listing', async () => {
+  const stub = new StubAdapter({ name: 'digitalassets', demand: 0.9 });
+  const { s, seller } = await sellerWith({ stub, unitCostMinor: 1_000, estResaleMinor: 4_000, ttlTicks: 20 });
+  try {
+    const reg = s.registry;
+    reg.registerStrategies(
+      'seller',
+      ['margin-keeper', 'volume-mover'],
+      (id, strat, deps) => new SellerAgent(id, strat, deps, { maxMintedHoldings: 0 }),
+    );
+    reg.register(seller);
+
+    await seller.runTick(1);
+    await s.bus.drain();
+    const live = seller.liveOffers()[0];
+    assert.ok(live, 'the predecessor has a listing out in the world');
+
+    // The Treasury kills it at tick 2. The listing does not stop existing on the
+    // channel just because the agent that placed it does.
+    await reg.terminate('seller-1', 'survival: below benchmark');
+    const heir = reg.spawnAlternative('seller', (id) => s.depsFor(id), ['margin-keeper']);
+    assert.ok(heir);
+    const successor = heir as SellerAgent;
+    assert.equal(successor.stats().inheritedOffers, 1, 'the offer came across with the role');
+    assert.equal(successor.liveOffers()[0]?.offerId, live.offerId);
+
+    // The fill lands three ticks later, for the dead agent's offerId.
+    stub.fills = [{ offerId: live.offerId, qty: 1, unitPrice: money(3_000, 'SAR'), feeMinor: 180, tick: 5 }];
+    await successor.runTick(5);
+    await s.bus.drain();
+
+    const sales = s.ledger.entries({ type: 'SALE' });
+    assert.equal(sales.length, 1, 'the revenue was booked, not dropped');
+    assert.equal(sales[0]!.agentId, successor.id);
+    assert.equal(sales[0]!.meta['inheritedOffer'], true);
+    assert.equal(s.ledger.entries({ type: 'ORPHAN_FILL' }).length, 0, 'and it was not an orphan: it had an owner');
+    // No second cost of goods: the predecessor terminate() already wrote the
+    // holding off, so charging it again would book the same loss twice.
+    assert.deepEqual(
+      sales[0]!.legs.map((l) => l.account),
+      ['cash', 'fees', 'revenue'],
+    );
+    assert.equal(sales[0]!.legs.reduce((a, l) => a + l.amount, 0), 0);
+    assert.equal(s.ledger.balanceOf('inventory'), 0, 'inventory is neither overstated nor negative');
+    assert.equal(s.ledger.verify().ok, true);
+    assert.equal(successor.stats().sold, 1);
+  } finally {
+    s.close();
+  }
+});
+
+/* ===== AMENDMENT A8b: an expiry must not discard a fill that is settling ==== */
+
+test('A8b: an expiry with units unaccounted for RETAINS the offer until the fill lands', async () => {
+  const stub = new StubAdapter({ name: 'digitalassets', demand: 0.9 });
+  const { s, seller } = await sellerWith({ stub, unitCostMinor: 1_000, estResaleMinor: 4_000, ttlTicks: 20 });
+  try {
+    await seller.runTick(1);
+    await s.bus.drain();
+    const live = seller.liveOffers()[0];
+    assert.ok(live);
+
+    // The channel says the listing expired with NOTHING left on it: the unit
+    // sold, and its cash is somewhere between the sale and settlement.
+    stub.expired = [
+      {
+        channel: 'digitalassets',
+        offerId: live.offerId,
+        sku: live.sku,
+        priceMinor: live.priceMinor,
+        remaining: 0,
+        listedTick: 1,
+        expiredTick: 2,
+      },
+    ];
+    await seller.runTick(2);
+    await s.bus.drain();
+
+    assert.equal(seller.stats().openOffers, 1, 'the offer is retained, not deleted');
+    assert.equal(seller.stats().retainedOffers, 1);
+    assert.equal(stub.calls['publish'], 1, 'and the holding is NOT re-listed for a unit already sold');
+
+    // Settlement arrives two ticks later, keyed on that very offerId.
+    stub.fills = [{ offerId: live.offerId, qty: 1, unitPrice: money(3_000, 'SAR'), feeMinor: 180, tick: 4 }];
+    await seller.runTick(4);
+    await s.bus.drain();
+
+    const sales = s.ledger.entries({ type: 'SALE' });
+    assert.equal(sales.length, 1, 'the revenue was booked against the right offer');
+    assert.equal(s.ledger.entries({ type: 'ORPHAN_FILL' }).length, 0);
+    assert.equal(sales[0]!.meta['expiredTick'], 2, 'and the books record that it settled after expiry');
+    assert.equal(sales[0]!.legs.reduce((a, l) => a + l.amount, 0), 0);
+    assert.equal(s.ledger.balanceOf('inventory'), 0, 'no phantom inventory left behind');
+    assert.equal(seller.stats().openOffers, 0, 'and the offer is closed once it is settled');
+    assert.equal(seller.stats().holdings, 0);
+    assert.equal(s.ledger.verify().ok, true);
+  } finally {
+    s.close();
+  }
+});
+
+test('A8b: an expiry with nothing outstanding still releases the holding immediately', async () => {
+  const stub = new StubAdapter({ name: 'digitalassets', demand: 0.5 });
+  const { s, seller } = await sellerWith({ stub, unitCostMinor: 500, estResaleMinor: 4_000, ttlTicks: 40 });
+  try {
+    await seller.runTick(1);
+    await s.bus.drain();
+    const live = seller.liveOffers()[0];
+    assert.ok(live);
+    stub.expired = [
+      {
+        channel: 'digitalassets',
+        offerId: live.offerId,
+        sku: live.sku,
+        priceMinor: live.priceMinor,
+        remaining: 1,
+        listedTick: 1,
+        expiredTick: 2,
+      },
+    ];
+    await seller.runTick(2);
+    await s.bus.drain();
+    assert.equal(seller.stats().retainedOffers, 0, 'nothing was sold, so nothing is settling');
+    assert.equal(stub.calls['publish'], 2, 're-listed at once, marked down');
+  } finally {
+    s.close();
+  }
+});
+
+test('A8b: a retained offer is released once settlement can no longer arrive', async () => {
+  const stub = new StubAdapter({ name: 'digitalassets', demand: 0.9 });
+  const s = await makeStack({}, { channels: [], extraChannels: new Map([['digitalassets', stub]]) });
+  try {
+    const seller = new SellerAgent('seller-grace', 'margin-keeper', s.depsFor('seller-grace'), {
+      maxMintedHoldings: 0,
+      style: { ttlTicks: 40 },
+      settlementGraceTicks: 3,
+    });
+    s.bus.publish({
+      type: 'INVENTORY_ADDED',
+      from: 'scout-1',
+      tick: 0,
+      payload: {
+        holding: holding({ channel: 'digitalassets', unitCost: money(500, 'SAR'), meta: { estResaleValueMinor: 4_000 } }),
+        channel: 'digitalassets',
+        sku: 'sku-1',
+        qty: 1,
+        unitCostMinor: 500,
+        costMinor: 500,
+        estResaleMinor: 4_000,
+        buyerId: 'scout-1',
+        tick: 0,
+      },
+    });
+    await s.bus.drain();
+    await seller.runTick(1);
+    await s.bus.drain();
+    const live = seller.liveOffers()[0];
+    assert.ok(live);
+
+    stub.expired = [
+      { channel: 'digitalassets', offerId: live.offerId, sku: live.sku, priceMinor: live.priceMinor, remaining: 0, listedTick: 1, expiredTick: 2 },
+    ];
+    await seller.runTick(2);
+    assert.equal(seller.stats().retainedOffers, 1);
+    assert.equal(stub.calls['publish'], 1, 'held back while the fill might still arrive');
+
+    // The fill never comes. After the grace window the holding goes back to work
+    // rather than being blocked on a settlement that is not going to happen.
+    for (let t = 3; t <= 5; t++) await seller.runTick(t);
+    await s.bus.drain();
+    assert.equal(seller.stats().openOffers, 1, 'exactly one live offer: the NEW one');
+    assert.ok(seller.liveOffers()[0]);
+    assert.notEqual(seller.liveOffers()[0]?.offerId, live.offerId, 're-listed under a fresh offer');
+    assert.equal(stub.calls['publish'], 2);
+    assert.equal(s.ledger.verify().ok, true);
   } finally {
     s.close();
   }

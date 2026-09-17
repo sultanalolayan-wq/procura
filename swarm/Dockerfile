@@ -32,7 +32,14 @@ COPY package.json ./
 
 # The state directory must exist and be writable by the unprivileged user
 # BEFORE it becomes a volume, or Docker will create it root-owned.
-RUN mkdir -p /app/var && chown -R node:node /app
+#
+# ONLY /app/var. Chowning all of /app handed the runtime user write access to
+# the code it is about to execute, so any file-write primitive (a path-traversal
+# bug, a poisoned state file, a compromised dependency — there are none today,
+# but that is a property of this commit, not of the image) became code execution
+# on the next restart. /app/dist stays root-owned and read-only to `node`, and
+# the container also runs with a read-only root filesystem.
+RUN mkdir -p /app/var && chown node:node /app/var
 
 USER node
 

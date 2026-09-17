@@ -5,10 +5,27 @@
  * runs BEFORE adapter.buy, so a ToS-refusing channel (ksa_ecom) is never reached;
  * every purchase carries an idempotency key; and the bandit's reward is the
  * REALISED margin correlated by traceId when the sale settles, NEVER the margin
- * estimated at purchase time. Callers: runtime/supervisor, registry.
+ * estimated at purchase time.
+ *
+ * THE COMMISSION IS PART OF THE COST (amendment A7). The buy commission is
+ * CAPITALISED into the holding's unit cost, not expensed to `fees`. Expensing it
+ * left rec.unitCostMinor equal to the bare ask, so the seller's cost floor
+ * certified round trips that lose money: buy at 4000 with a 100 commission, list
+ * at 4200, the floor says "clears cost + fees" and the trade nets -30. The
+ * split is exact integer arithmetic — unit cost is floor(spent / qty) and the
+ * remainder that cannot be divided into whole minor units per unit goes to
+ * `fees` — so remaining * unitCost always equals the inventory account.
+ *
+ * NO RESERVATION OUTLIVES ITS BUY (amendment A6). The span from reserve() to
+ * commit() is wrapped in try/finally. It used to release on exactly two paths,
+ * so a ledger.append() that threw in between — ENOSPC, EIO, a closed ledger on a
+ * box that runs for months — leaked the reservation permanently, and a leaked
+ * reservation reduces availableCash for every agent for the life of the process.
+ * Callers: runtime/supervisor, registry.
  */
 
 import { BudgetDenied, PolicyDenied } from '../core/errors.js';
+import type { Leg } from '../core/ledger.js';
 import { idempotencyKey, newId } from '../core/ids.js';
 import { money, type Minor, type Money } from '../core/money.js';
 import type { AgentId, Holding, Opportunity } from '../core/types.js';
@@ -349,100 +366,134 @@ export class ScoutAgent extends BaseAgent {
       throw err;
     }
 
-    const idem = idempotencyKey(['scout.buy', this.id, c.channel, o.id, c.qty, tick]);
-    this.emit('BUY_REQUEST', { channel: c.channel, opportunityId: o.id, sku: o.sku, qty: c.qty, totalMinor, idem, tick });
-
-    let bought: { holding: Holding; feeMinor: Minor };
+    // From here to the commit, EVERY exit gives the reservation back. The
+    // finally is the point: the paths below can throw between the adapter call
+    // and the ledger write, and an unsettled reservation must never outlive the
+    // attempt that made it.
+    let settled = false;
     try {
-      bought = await this.breaker(c.channel, 'buy').exec(() => c.adapter.buy(o, c.qty, tick, idem));
-    } catch (err) {
-      this.releaseReservation(reservation);
-      this.emit('BUY_RESULT', {
-        channel: c.channel,
-        sku: o.sku,
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-        tick,
-      });
-      throw err; // act() counts it, logs it and contains it
-    }
+      const idem = idempotencyKey(['scout.buy', this.id, c.channel, o.id, c.qty, tick]);
+      this.emit('BUY_REQUEST', { channel: c.channel, opportunityId: o.id, sku: o.sku, qty: c.qty, totalMinor, idem, tick });
 
-    const filledQty = Math.max(0, bought.holding.qty);
-    const costMinor = bought.holding.unitCost.amount * filledQty;
-    const feeMinor = Math.max(0, bought.feeMinor);
-    const spentMinor = costMinor + feeMinor;
-    if (filledQty <= 0 || spentMinor <= 0) {
-      this.releaseReservation(reservation);
-      this.log.warn('scout.empty_fill', { channel: c.channel, sku: o.sku, tick });
-      return false;
-    }
+      let bought: { holding: Holding; feeMinor: Minor };
+      try {
+        bought = await this.breaker(c.channel, 'buy').exec(() => c.adapter.buy(o, c.qty, tick, idem));
+      } catch (err) {
+        this.emit('BUY_RESULT', {
+          channel: c.channel,
+          sku: o.sku,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+          tick,
+        });
+        throw err; // act() counts it, logs it and contains it; finally releases
+      }
 
-    // 3. LEDGER: inventory + fees debited, cash credited. Balanced by construction.
-    this.deps.ledger.append({
-      tick,
-      type: 'BUY',
-      agentId: this.id,
-      currency: this.cfg.baseCurrency,
-      legs: [
-        { account: 'inventory', amount: costMinor },
-        { account: 'fees', amount: feeMinor },
+      const filledQty = Math.max(0, bought.holding.qty);
+      const askCostMinor = bought.holding.unitCost.amount * filledQty;
+      const feeMinor = Math.max(0, bought.feeMinor);
+      const spentMinor = askCostMinor + feeMinor;
+      if (filledQty <= 0 || spentMinor <= 0) {
+        this.log.warn('scout.empty_fill', { channel: c.channel, sku: o.sku, tick });
+        return false;
+      }
+
+      // The commission is part of what the unit cost, so it is carried IN the
+      // unit cost. Integer lockstep: the per-unit figure is floored and the
+      // indivisible remainder is expensed, so inventory == qty * unitCost to the
+      // halala and the seller's floor sees the real all-in basis.
+      const unitCostAllInMinor = Math.floor(spentMinor / filledQty);
+      const inventoryMinor = unitCostAllInMinor * filledQty;
+      const feeResidualMinor = spentMinor - inventoryMinor;
+      const holding: Holding = {
+        ...bought.holding,
+        unitCost: money(unitCostAllInMinor, this.cfg.baseCurrency),
+        meta: {
+          ...bought.holding.meta,
+          askUnitCostMinor: bought.holding.unitCost.amount,
+          buyFeeMinor: feeMinor,
+          buyFeeCapitalisedMinor: feeMinor - feeResidualMinor,
+          allInUnitCostMinor: unitCostAllInMinor,
+        },
+      };
+
+      // 3. LEDGER: inventory + the indivisible fee remainder debited, cash
+      //    credited. Balanced by construction.
+      const legs: Leg[] = [
+        { account: 'inventory', amount: inventoryMinor },
+        ...(feeResidualMinor > 0 ? ([{ account: 'fees', amount: feeResidualMinor }] as Leg[]) : []),
         { account: 'cash', amount: -spentMinor },
-      ],
-      idempotencyKey: idem,
-      meta: {
+      ];
+      this.deps.ledger.append({
+        tick,
+        type: 'BUY',
+        agentId: this.id,
+        currency: this.cfg.baseCurrency,
+        legs,
+        idempotencyKey: idem,
+        meta: {
+          channel: c.channel,
+          sku: o.sku,
+          qty: filledQty,
+          requestedQty: c.qty,
+          holdingId: holding.id,
+          arm: this.currentArm.id,
+          strategyId: this.strategyId,
+          estMarginMinor: c.score.expectedNetMinor,
+          confidence: o.confidence,
+          askUnitCostMinor: bought.holding.unitCost.amount,
+          unitCostMinor: unitCostAllInMinor,
+          buyFeeMinor: feeMinor,
+        },
+      });
+      this.commitReservation(reservation, Math.min(spentMinor, totalMinor), { channel: c.channel, sku: o.sku });
+      settled = true;
+      this.buys++;
+
+      // 4. Hand the holding to the seller and open a trade the sale will close.
+      const env = this.emit('INVENTORY_ADDED', {
+        holding,
         channel: c.channel,
         sku: o.sku,
         qty: filledQty,
-        requestedQty: c.qty,
-        holdingId: bought.holding.id,
+        unitCostMinor: unitCostAllInMinor,
+        costMinor: spentMinor,
+        estResaleMinor: o.estResaleValue.amount,
+        buyerId: this.id,
         arm: this.currentArm.id,
-        strategyId: this.strategyId,
+        tick,
+      });
+      this.openTrades.set(env.traceId, {
+        traceId: env.traceId,
+        arm: this.currentArm.id,
+        channel: c.channel,
+        sku: o.sku,
+        holdingId: holding.id,
+        qty: filledQty,
+        costMinor: spentMinor,
         estMarginMinor: c.score.expectedNetMinor,
-        confidence: o.confidence,
-      },
-    });
-    this.commitReservation(reservation, Math.min(spentMinor, totalMinor), { channel: c.channel, sku: o.sku });
-    this.buys++;
-
-    // 4. Hand the holding to the seller and open a trade the sale will close.
-    const env = this.emit('INVENTORY_ADDED', {
-      holding: bought.holding,
-      channel: c.channel,
-      sku: o.sku,
-      qty: filledQty,
-      unitCostMinor: bought.holding.unitCost.amount,
-      costMinor: spentMinor,
-      estResaleMinor: o.estResaleValue.amount,
-      buyerId: this.id,
-      arm: this.currentArm.id,
-      tick,
-    });
-    this.openTrades.set(env.traceId, {
-      traceId: env.traceId,
-      arm: this.currentArm.id,
-      channel: c.channel,
-      sku: o.sku,
-      holdingId: bought.holding.id,
-      qty: filledQty,
-      costMinor: spentMinor,
-      estMarginMinor: c.score.expectedNetMinor,
-      tick,
-      proceedsMinor: 0,
-      disposedQty: 0,
-      resolved: false,
-    });
-    this.emit('BUY_RESULT', {
-      channel: c.channel,
-      sku: o.sku,
-      ok: true,
-      qty: filledQty,
-      spentMinor,
-      holdingId: bought.holding.id,
-      traceId: env.traceId,
-      tick,
-    });
-    this.persistBandit();
-    return true;
+        tick,
+        proceedsMinor: 0,
+        disposedQty: 0,
+        resolved: false,
+      });
+      this.emit('BUY_RESULT', {
+        channel: c.channel,
+        sku: o.sku,
+        ok: true,
+        qty: filledQty,
+        spentMinor,
+        holdingId: holding.id,
+        traceId: env.traceId,
+        tick,
+      });
+      this.persistBandit();
+      return true;
+    } finally {
+      // Committed reservations are settled; anything else goes back to the pool,
+      // however this block was left — return, throw or otherwise.
+      if (!settled) this.releaseReservation(reservation);
+    }
   }
 
   // ------------------------------------------------- realised-margin feedback --

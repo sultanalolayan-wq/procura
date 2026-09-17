@@ -12,12 +12,25 @@ import type { Holding, Offer, Opportunity } from '../core/types.js';
 import type { ChannelCapabilities } from './adapter.js';
 import { MarketSimulator, SimulatedChannelAdapter, type ChannelParams } from './simulator.js';
 
+/**
+ * UNVERIFIED GENERALISATION, PENDING PER-PLATFORM REVIEW. This note names no
+ * platform, cites no clause and carries no date, so it cannot be relied on as a
+ * statement of any venue's actual terms. It records the working assumption this
+ * channel is built on, at the same standard of candour as the VAT assumption
+ * below — the previous wording asserted both halves flatly, which was an
+ * asymmetry in candour, not a finding.
+ */
 export const KSA_ECOM_TOS_NOTE =
-  'Automated purchasing is PROHIBITED by the terms of service of the Saudi marketplace ' +
-  'platforms this channel models (automated ordering, bots and scripted checkout are ' +
-  'disallowed). The buy path therefore requires a human in the loop: a person must review ' +
-  'and place any purchase manually. Selling/listing is permitted for a merchant account. ' +
-  'Jurisdiction: SA.';
+  'UNVERIFIED ASSUMPTION, TO BE CONFIRMED AGAINST EACH PLATFORM\'S CURRENT TERMS: the Saudi ' +
+  'marketplace platforms this channel models are ASSUMED to prohibit automated ordering, bots ' +
+  'and scripted checkout. No platform is named, no clause is cited and this note is undated. ' +
+  'The buy path therefore requires a human in the loop: a person must review and place any ' +
+  'purchase manually — and this adapter refuses to buy unconditionally regardless. ' +
+  'Selling/listing is ASSUMED to be possible for an approved merchant account, but is NOT ' +
+  'assumed to be unconditional: merchant APIs typically carry their own conditions (an ' +
+  'approved account, a named human operator, rate limits, listing-content rules) and some ' +
+  'programmes prohibit automated repricing outright. Confirm every one of these per platform, ' +
+  'in writing, before relying on any of it. Jurisdiction: SA.';
 
 /**
  * ASSUMPTION — NOT VERIFIED LAW. The VAT rate is a configuration parameter
@@ -46,8 +59,25 @@ export interface VatBreakdown {
 export class KsaEcomAdapter extends SimulatedChannelAdapter {
   readonly name = 'ksa_ecom';
 
+  /**
+   * SELL-ONLY. canBuy is FALSE, and that is the honest declaration: this adapter
+   * has no automated buy path at all — buy() throws unconditionally — so
+   * claiming the capability and then refusing every call was a contradiction.
+   *
+   * It was also load-bearing. policy.checkChannel denies any adapter that
+   * declares canBuy together with buyRequiresHumanApproval when no approval
+   * channel is configured, which rejected the WHOLE adapter at boot. The result
+   * was that the VAT logic, the SAR pricing and the VAT-inclusive display
+   * convention — the headline Saudi capability — were unreachable dead code in
+   * every default run, and the VAT code one would most want exercised was the
+   * least exercised code in the repo.
+   *
+   * buyRequiresHumanApproval stays TRUE: it is a true statement about the buy
+   * path this channel does not offer, and it keeps the constraint visible to the
+   * policy engine, the dashboard and any future caller.
+   */
   readonly capabilities: ChannelCapabilities = Object.freeze({
-    canBuy: true,
+    canBuy: false,
     // The flag the policy engine reads...
     buyRequiresHumanApproval: true,
     canSell: true,
@@ -93,6 +123,7 @@ export class KsaEcomAdapter extends SimulatedChannelAdapter {
           kind: 'ksa_listing',
           currency: this.currency,
           // Surfaced so a human reviewer sees the constraint on the same screen.
+          sellOnly: true,
           buyRequiresHumanApproval: true,
           automatedPurchaseProhibited: true,
           tosNote: KSA_ECOM_TOS_NOTE,
@@ -109,6 +140,10 @@ export class KsaEcomAdapter extends SimulatedChannelAdapter {
    * key or a policy engine bug can never turn into an automated purchase.
    */
   override async buy(o: Opportunity, qty: number, tick: number, idem: string): Promise<{ holding: Holding; feeMinor: Minor }> {
+    // NOTE: nothing below reads this.capabilities. The refusal must survive a
+    // mutated, replaced or missing capability object — the whole protection used
+    // to key off one boolean in one frozen object literal, and a frozen literal
+    // is a convention, not a guarantee.
     throw new PolicyDenied(
       'TOS_AUTOMATED_PURCHASE_PROHIBITED',
       `${this.name}.buy() refused: automated purchasing is prohibited by the terms of service of the ` +
@@ -116,14 +151,16 @@ export class KsaEcomAdapter extends SimulatedChannelAdapter {
         `This adapter has no automated buy path at all.`,
       {
         channel: this.name,
-        jurisdiction: this.capabilities.jurisdiction,
+        jurisdiction: 'SA',
         buyRequiresHumanApproval: true,
         tosNote: KSA_ECOM_TOS_NOTE,
         sku: o?.sku ?? null,
         qty: qty ?? null,
         tick: tick ?? null,
         idem: idem ?? null,
-        note: 'this refusal precedes the init/ready check on purpose',
+        note:
+          'this refusal precedes the init/ready check AND ignores this.capabilities on purpose: ' +
+          'it cannot be disabled by mutating a flag',
       },
     );
   }

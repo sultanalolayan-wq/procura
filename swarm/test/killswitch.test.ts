@@ -6,7 +6,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { KillSwitch, haltFilePath, HALT_FILE } from '../src/governance/killswitch.js';
@@ -178,6 +178,69 @@ test('snapshot reports listeners, watchers and the latch', async () => {
     assert.equal(s.listeners, 1);
     assert.equal(s.watchers, 1);
     assert.equal(s.trippedAt, null);
+  } finally {
+    stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+/* ===================================================================== */
+/* FIX B5 — a dangling symlink named HALT must not disarm the stop button */
+/* ===================================================================== */
+
+test('FIX B5: a DANGLING SYMLINK named HALT trips the switch instead of silently disarming it', async () => {
+  const dir = tmp();
+  const clock = new TestClock(0);
+  const ks = new KillSwitch(nullLogger, clock);
+  // Pre-planted by anyone with write access to the data directory: the link
+  // exists, `ls` shows it, the operator's documented `touch HALT` finds a name
+  // already there — and existsSync() RESOLVES it, so it reported false and the
+  // emergency stop was quietly disabled.
+  symlinkSync(join(dir, 'no-such-target'), join(dir, HALT_FILE));
+  const stop = ks.watchFile(dir, clock, { intervalMs: 100 });
+  try {
+    assert.equal(ks.tripped, true, 'a broken symlink is still an entry named HALT');
+    assert.match(ks.reason ?? '', /halt file present/);
+    assert.match(ks.reason ?? '', /symlink/);
+  } finally {
+    stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('FIX B5: a DIRECTORY named HALT trips too — anything at that path is a stop', () => {
+  const dir = tmp();
+  const clock = new TestClock(0);
+  const ks = new KillSwitch(nullLogger, clock);
+  mkdirSync(join(dir, HALT_FILE));
+  const stop = ks.watchFile(dir, clock, { intervalMs: 100 });
+  try {
+    assert.equal(ks.tripped, true);
+    assert.match(ks.reason ?? '', /directory/);
+  } finally {
+    stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('FIX B8: the trip reason carries no filesystem path — the path lives in meta', async () => {
+  const dir = tmp();
+  const clock = new TestClock(0);
+  const ks = new KillSwitch(nullLogger, clock);
+  const stop = ks.watchFile(dir, clock, { intervalMs: 100 });
+  try {
+    writeFileSync(join(dir, HALT_FILE), 'stop');
+    clock.advance(100);
+    await flush();
+    assert.equal(ks.tripped, true);
+    // server.ts states that no response body contains a file path, and this
+    // reason is returned verbatim by routes. It must not contradict that.
+    assert.equal((ks.reason ?? '').includes(dir), false, 'the reason leaked the data directory');
+    assert.equal(/\/(home|root|tmp|Users|var)\//.test(ks.reason ?? ''), false, 'the reason leaked a path');
+    // The operator still gets the path, in structured metadata.
+    assert.equal(ks.meta?.['file'], join(dir, HALT_FILE));
+    assert.equal(ks.snapshot().meta?.['file'], join(dir, HALT_FILE));
   } finally {
     stop();
     rmSync(dir, { recursive: true, force: true });

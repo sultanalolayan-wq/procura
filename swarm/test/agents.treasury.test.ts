@@ -13,7 +13,7 @@ import type { LedgerEntry } from '../src/core/ledger.js';
 import type { AgentId } from '../src/core/types.js';
 import { BaseAgent, type AgentDeps } from '../src/agents/base.js';
 import { AgentRegistry } from '../src/agents/registry.js';
-import { TreasuryAgent } from '../src/agents/treasury.js';
+import { TreasuryAgent, MAX_CATCHUP_WINDOWS } from '../src/agents/treasury.js';
 import { makeStack, type Stack } from './agents.harness.js';
 
 /** An agent that loses a fixed amount every tick and says so. */
@@ -154,6 +154,11 @@ test('a drawdown breach halts the swarm and says by how much', async () => {
     await treasury.runTick(1);
     assert.equal(s.killSwitch.tripped, false);
 
+    // AMENDMENT A9 — adjusted deliberately. act() now charges a modelled compute
+    // cost, so the treasury's own auditing moves cash and the drawdown is no
+    // longer purely the trading loss. The DELTA is what this test is about.
+    const beforeLoss = s.budget.drawdownMinor();
+    assert.ok(beforeLoss > 0, 'auditing the swarm costs something, and it is on the books');
     s.ledger.append({
       tick: 2,
       type: 'LOSS',
@@ -166,18 +171,20 @@ test('a drawdown breach halts the swarm and says by how much', async () => {
       idempotencyKey: 'big-loss',
       meta: {},
     });
-    assert.equal(s.budget.drawdownMinor(), 5_001);
+    assert.equal(s.budget.drawdownMinor() - beforeLoss, 5_001, 'the loss itself is exact');
+    const breached = s.budget.drawdownMinor();
 
     await treasury.runTick(2);
     assert.equal(s.killSwitch.tripped, true);
-    assert.match(String(s.killSwitch.reason), /max drawdown breached: 5001 > 5000/);
+    assert.match(String(s.killSwitch.reason), /max drawdown breached: \d+ > 5000/);
+    assert.ok(s.budget.drawdownMinor() >= breached);
     assert.equal(treasury.crashes, 0, 'a risk limit is enforcement, not a crash');
 
     await s.bus.drain();
     const halt = s.of('HALT')[0];
     assert.ok(halt);
     assert.equal((halt.payload as { source: string }).source, 'drawdown');
-    assert.equal((halt.payload as { drawdownMinor: number }).drawdownMinor, 5_001);
+    assert.ok((halt.payload as { drawdownMinor: number }).drawdownMinor >= breached);
 
     // And nothing may spend afterwards.
     assert.equal(s.budget.availableCash('treasury-1'), 0);
@@ -244,6 +251,11 @@ test('PROBATION halves the agent caps and a later PASS clears the status', async
     assert.equal(after.tokenCap, Math.floor(before.tokenCap / 2));
 
     // Window 1 turns a profit: the status clears (the caps stay tightened).
+    // AMENDMENT A1 — changed deliberately. Posting cash used to be enough to
+    // clear probation; it is not any more, and it should never have been. The
+    // window has to contain REALISED outcomes, so the agent records them — which
+    // is what "turning a profit" actually means. Note it also has to outweigh
+    // the -100 the loser already realised at tick 5, inside this same window.
     for (let t = 6; t < 10; t++) {
       s.ledger.append({
         tick: t,
@@ -256,6 +268,14 @@ test('PROBATION halves the agent caps and a later PASS clears the status', async
         ],
         idempotencyKey: `gain-p-${t}`,
         meta: {},
+      });
+      s.survival.record({
+        strategyId: 'alpha',
+        agentId: 'scout-p',
+        tick: t,
+        netMinor: 400,
+        success: true,
+        meta: { kind: 'trade' },
       });
       await treasury.runTick(t);
     }
@@ -428,7 +448,16 @@ test('the treasury is exempt from survival termination, however negative its own
     assert.ok(row);
     assert.equal(row.verdict, 'EXEMPT');
     assert.match(row.reason, /exempt from survival termination by design/);
-    assert.equal(row.netMinor, -1_500, 'its loss is measured and reported, just not fatal');
+    // The reported figure is ledger cash flow over the window, which now also
+    // carries the treasury's own modelled compute cost (amendment A9).
+    const computeInWindow = s.ledger
+      .entries({ agentId: 'treasury-1', type: 'TOKEN_SPEND' })
+      // Only the charges act() made; the -300 legs above are this test's own.
+      .filter((e) => e.tick >= 0 && e.tick <= 4 && e.meta['model'] === 'default')
+      .reduce((a, e) => a + e.legs.filter((l) => l.account === 'cash').reduce((x, l) => x + l.amount, 0), 0);
+    assert.ok(computeInWindow < 0, 'the auditor pays for its own compute');
+    assert.equal(row.netMinor, -1_500 + computeInWindow, 'its loss is measured and reported, just not fatal');
+    assert.equal(row.judgedNetMinor, -1_500, 'and what it realised is reported separately');
     // The evaluator was never even asked about it.
     assert.equal(s.survival.state('treasury-1')?.verdict ?? null, null);
   } finally {
@@ -507,6 +536,160 @@ test('a TreasuryAgent without a registry is refused at construction', async () =
       () => new TreasuryAgent('treasury-3', 'auditor', s.depsFor('treasury-3'), undefined as unknown as never),
       /TREASURY_NO_REGISTRY|AgentRegistry is required/,
     );
+  } finally {
+    s.close();
+  }
+});
+
+/* ============ AMENDMENT A2: skipped ticks must not skip whole windows ======= */
+
+test('A2: windows the supervisor ticked past are still judged, oldest first', async () => {
+  // The supervisor SKIPS the ticks a slow tick missed — that is documented,
+  // deliberate behaviour. The treasury used to jump lastJudgedWindow straight to
+  // the newest completed window, so the windows in between were never evaluated
+  // and the consecutive-failure streak the whole rule turns on never grew.
+  const { s, reg, treasury } = await wire({ ARES_PROBATION_WINDOWS: '1' });
+  try {
+    const loser = new Loser('scout-skip', 'alpha', s.depsFor('scout-skip'));
+    reg.register(loser);
+
+    // Windows 0 and 1 (ticks 0..9) both produce real, failing activity...
+    for (let t = 0; t < 10; t++) await loser.runTick(t);
+    assert.equal(treasury.stats().lastJudgedWindow, -1, 'the treasury has not run at all yet');
+
+    // ...and the treasury's first wake-up is at tick 10, on the far side of BOTH
+    // boundaries. Window 0 is a first failure, window 1 the fatal second.
+    await treasury.runTick(10);
+    await s.bus.drain();
+
+    assert.equal(treasury.stats().lastJudgedWindow, 1, 'it caught up to the newest completed window');
+    assert.equal(treasury.stats().windowsReplayed, 1, 'and it replayed the one it had skipped past');
+    assert.equal(s.survival.state('scout-skip')?.failStreak, 2, 'two failing windows, two counts');
+    assert.equal(loser.isTerminated, true, 'so the second one was fatal, as it always should have been');
+    assert.equal(treasury.stats().terminations, 1);
+  } finally {
+    s.close();
+  }
+});
+
+test('A2: the catch-up is bounded and says so when it truncates', async () => {
+  const { s, reg, treasury } = await wire({ ARES_PROBATION_WINDOWS: '9' });
+  try {
+    const loser = new Loser('scout-far', 'alpha', s.depsFor('scout-far'));
+    reg.register(loser);
+    for (let t = 0; t < 5; t++) await loser.runTick(t);
+
+    // Window size 5, so tick 500 is window 100: a backlog of 100 windows.
+    await treasury.runTick(500);
+    const st = treasury.stats();
+    assert.equal(st.lastJudgedWindow, 99, 'it is caught up');
+    assert.equal(st.windowsReplayed, MAX_CATCHUP_WINDOWS - 1);
+    assert.equal(st.windowsDropped, 100 - MAX_CATCHUP_WINDOWS, 'and it is honest about what it skipped');
+    assert.equal(treasury.crashes, 0, 'a bounded catch-up is not a crash');
+  } finally {
+    s.close();
+  }
+});
+
+test('A2: judging is still once per window, not once per tick', async () => {
+  const { s, reg, treasury } = await wire({ ARES_PROBATION_WINDOWS: '3' });
+  try {
+    const loser = new Loser('scout-once', 'alpha', s.depsFor('scout-once'));
+    reg.register(loser);
+    for (let t = 0; t <= 15; t++) {
+      await loser.runTick(t);
+      await treasury.runTick(t);
+    }
+    assert.equal(treasury.stats().lastJudgedWindow, 2, 'windows 0, 1 and 2 have completed');
+    assert.equal(treasury.stats().windowsReplayed, 0, 'nothing was skipped, so nothing was replayed');
+    assert.equal(s.survival.state('scout-once')?.failStreak, 3, 'three windows, three counts');
+  } finally {
+    s.close();
+  }
+});
+
+/* ======= AMENDMENT A5: a quarantined agent is reclaimed, not stranded ======= */
+
+test('A5: a quarantined agent is terminated, its reservations released and its caps reclaimed', async () => {
+  const { s, reg, treasury } = await wire();
+  try {
+    const stuck = new Loser('scout-quar', 'alpha', s.depsFor('scout-quar'));
+    const survivor = new Winner('scout-live', 'beta', s.depsFor('scout-live'));
+    reg.register(stuck);
+    reg.register(survivor);
+
+    // It works, then it crashes enough that the supervisor quarantines it —
+    // which, by design, is NOT a termination: that stays the Treasury's call.
+    for (let t = 0; t < 3; t++) {
+      await stuck.runTick(t);
+      await survivor.runTick(t);
+      await treasury.runTick(t);
+    }
+    const res = s.budget.reserve('scout-quar', 'cash', 3_000, 3);
+    assert.equal(s.budget.openReservations('scout-quar').length, 1);
+    const survivorCapBefore = s.budget.snapshot().agents.find((a) => a.agentId === 'scout-live')!.cashCapMinor;
+    const availableToOthersWhileStuck = s.budget.availableCash('scout-live');
+
+    stuck.quarantine('crashed too many times');
+    assert.equal(reg.active().some((a) => a.id === 'scout-quar'), false, 'active() drops it, as the supervisor needs');
+    assert.equal(reg.judgeable().some((a) => a.id === 'scout-quar'), true, 'but the Treasury can still reach it');
+
+    // Tick 5: the first window boundary after the quarantine.
+    for (let t = 3; t <= 5; t++) {
+      await survivor.runTick(t);
+      await treasury.runTick(t);
+    }
+    await s.bus.drain();
+
+    assert.equal(stuck.isTerminated, true, 'no longer stranded alive forever');
+    assert.equal(treasury.stats().terminations, 1);
+    const row = treasury.verdicts().find((v) => v.id === 'scout-quar');
+    assert.ok(row);
+    assert.equal(row.verdict, 'TERMINATE');
+    assert.match(row.reason, /quarantined/);
+
+    // The budget it was sitting on is back in circulation.
+    assert.deepEqual(s.budget.openReservations('scout-quar'), [], 'the reservation was released');
+    assert.equal(s.budget.availableCash('scout-quar'), 0);
+    const survivorAfter = s.budget.snapshot().agents.find((a) => a.agentId === 'scout-live')!;
+    assert.ok(survivorAfter.cashCapMinor > survivorCapBefore, 'its cap was reallocated to a survivor');
+    assert.ok(
+      s.budget.availableCash('scout-live') > availableToOthersWhileStuck,
+      'and everyone else can spend again',
+    );
+
+    // The role is restaffed rather than silently going empty.
+    assert.equal(treasury.stats().spawns, 1);
+    const spawned = s.of('AGENT_SPAWNED').find((e) => (e.payload as { replaces: string }).replaces === 'scout-quar');
+    assert.ok(spawned, 'a replacement was born');
+    assert.equal(s.ledger.verify().ok, true);
+    // Releasing an already-released reservation must stay a no-op, not a throw.
+    assert.throws(() => s.budget.commit(res, 3_000));
+  } finally {
+    s.close();
+  }
+});
+
+/* ===== AMENDMENT A4: survival state is durable across a process restart ===== */
+
+test('A4: the treasury gives the evaluator somewhere durable to keep its rows', async () => {
+  const { s, reg, treasury } = await wire({ ARES_PROBATION_WINDOWS: '1' });
+  try {
+    const loser = new Loser('scout-durable', 'alpha', s.depsFor('scout-durable'));
+    reg.register(loser);
+    for (let t = 0; t <= 5; t++) {
+      await loser.runTick(t);
+      await treasury.runTick(t);
+    }
+    assert.equal(s.survival.state('scout-durable')?.failStreak, 1);
+    assert.ok(treasury.run.startsWith('run:'), 'the boot is identified');
+
+    // The shared task memory is where it went — not the agent's private scope,
+    // which dies with the agent whose immunity we are trying not to re-arm.
+    const rows = s.taskMemory.getFact<Record<string, { failStreak: number; samples: number }>>('survival.rows', {});
+    assert.ok(rows['scout-durable'], 'the row is in the swarm-wide scope');
+    assert.equal(rows['scout-durable'].failStreak, 1);
+    assert.ok(rows['scout-durable'].samples >= 6);
   } finally {
     s.close();
   }

@@ -38,6 +38,13 @@ export interface GraveRecord {
   strategyId: string;
   reason: string;
   postmortem: PostmortemRecord | null;
+  /**
+   * Live operational state the successor must take over — not a lesson, a
+   * liability. A dead seller's listings keep filling on the channel long after
+   * it stops existing; without this the successor does not recognise the offer
+   * the fill names and the revenue is lost (amendment A8).
+   */
+  handover: Record<string, unknown>;
 }
 
 export interface RegistrySnapshot {
@@ -103,6 +110,22 @@ export class AgentRegistry {
     return this.all().filter((a) => !a.isTerminated && a.status !== 'terminated' && a.status !== 'quarantined');
   }
 
+  /**
+   * Everything the Treasury may still judge, reclaim or terminate: every agent
+   * that is not already dead, INCLUDING quarantined ones.
+   *
+   * active() deliberately means "will be ticked", which is why it drops
+   * quarantined agents — the supervisor must not run them. That is the right
+   * answer for scheduling and the wrong one for enforcement: a quarantined agent
+   * still holds open reservations against everyone else's headroom and still
+   * owns a budget line and a role. Judging only active() meant the Treasury
+   * could never reach it, so it was stranded alive forever. This accessor exists
+   * rather than a change to active() so the supervisor's meaning is untouched.
+   */
+  judgeable(): BaseAgent[] {
+    return this.all().filter((a) => !a.isTerminated && a.status !== 'terminated');
+  }
+
   byRole(role: AgentRole): BaseAgent[] {
     return this.all().filter((a) => a.role === role);
   }
@@ -133,6 +156,17 @@ export class AgentRegistry {
       this.logger.debug('registry.terminate_repeat', { id, reason });
       return;
     }
+    // Captured BEFORE terminate() runs: what the agent is holding open right
+    // now is what its successor has to inherit.
+    let handover: Record<string, unknown> = {};
+    try {
+      handover = a.handoverState();
+    } catch (err) {
+      this.logger.error('registry.handover_capture_failed', {
+        id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     await a.terminate(reason);
     this.graves.push({
       id: a.id,
@@ -140,6 +174,7 @@ export class AgentRegistry {
       strategyId: a.strategyId,
       reason,
       postmortem: a.lastPostmortem(),
+      handover,
     });
     this.logger.warn('registry.terminated', { id, role: a.role, strategyId: a.strategyId, reason });
   }
@@ -209,10 +244,14 @@ export class AgentRegistry {
       }
       inherited.push({ id: g.id, strategyId: g.strategyId, reason: g.reason });
     }
+    // The newest grave of this role is the agent this one is replacing, so its
+    // open liabilities are the ones that are still live on the channels.
+    const predecessor = graves.length > 0 ? (graves[graves.length - 1] as GraveRecord) : null;
     try {
       agentDeps.memory.setFact('inheritedFrom', inherited);
       agentDeps.memory.setFact('avoidStrategies', [...banned]);
       agentDeps.memory.setFact('generation', graves.length + 1);
+      agentDeps.memory.setFact('inheritedHandover', predecessor === null ? {} : predecessor.handover);
       agentDeps.memory.flush();
     } catch (err) {
       this.logger.error('registry.inheritance_facts_failed', {

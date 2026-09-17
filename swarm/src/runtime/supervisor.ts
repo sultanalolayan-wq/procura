@@ -11,7 +11,7 @@
  * sleep slice behind. Callers: runtime/orchestrator, src/index.ts, tests.
  */
 
-import { mkdirSync, writeFileSync, renameSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
 
 import type { AresConfig } from '../core/config.js';
@@ -33,6 +33,12 @@ export const WATCHDOG_TRIP_AFTER = 3;
 
 /** Default number of ticks between state snapshots. */
 export const DEFAULT_SNAPSHOT_EVERY = 20;
+
+/** Default number of snapshot files kept on disk when config says nothing. */
+export const DEFAULT_SNAPSHOT_RETAIN = 48;
+
+/** Filename prefix every snapshot shares, so pruning cannot eat a stranger. */
+export const SNAPSHOT_PREFIX = 'tick-';
 
 /**
  * Longest single clock.sleep() the loop will park in. The inter-tick wait is
@@ -57,11 +63,15 @@ export interface SupervisorDeps {
   onShutdown?: () => Promise<void>;
   /** Injected so tests can observe the force-exit path without dying. */
   exit?: (code: number) => void;
+  /** Injected so a test can observe the snapshot's durability sequence. */
+  fsync?: (fd: number) => void;
 }
 
 export interface SupervisorOptions {
   /** Ticks between snapshot+flush. 0 disables snapshots. */
   snapshotEveryTicks?: number;
+  /** Snapshot files kept on disk; older ones are deleted. */
+  snapshotRetain?: number;
   /** First tick number. Default 0. */
   startTick?: number;
   /** Stop by itself after this many executed ticks. Tests use it; 0 = forever. */
@@ -82,14 +92,26 @@ export interface SupervisorSnapshot {
   ticksSkipped: number;
   skipEvents: number;
   lastTickMs: number;
+  /** Wall time the tick spanned, INCLUDING event-loop time that was not ours. */
+  lastTickWallMs: number;
+  /** Event-loop time other work (an HTTP handler) stole during the last tick. */
+  lastExternalBlockedMs: number;
   maxTickMs: number;
   overruns: number;
   consecutiveOverruns: number;
   watchdogMs: number;
   tickIntervalMs: number;
   nextTickDueAt: number | null;
+  /** How far past its deadline the next tick is. 0 when the loop is on time. */
+  tickOverdueMs: number;
+  /** The loop has missed its deadline by more than a whole interval. */
+  stalled: boolean;
+  /** Set when the loop itself threw. The swarm is dead; nothing will tick. */
+  loopCrashed: boolean;
   snapshotEveryTicks: number;
+  snapshotRetain: number;
   snapshots: number;
+  snapshotsPruned: number;
   quarantined: AgentId[];
   phaseHalts: number;
   agentCrashes: number;
@@ -117,6 +139,7 @@ export class Supervisor {
   private readonly log: Logger;
   private readonly deps: SupervisorDeps;
   private readonly snapshotEvery: number;
+  private readonly snapshotRetain: number;
   private readonly maxTicks: number;
   private readonly sliceMs: number;
 
@@ -136,10 +159,16 @@ export class Supervisor {
   private ticksSkipped = 0;
   private skipEvents = 0;
   private lastTickMs = 0;
+  private lastTickWallMs = 0;
+  private lastExternalBlockedMs = 0;
+  private externalBlockedThisTick = 0;
+  private externalBlockedTotalMs = 0;
+  private loopCrashed = false;
   private maxTickMs = 0;
   private overruns = 0;
   private consecutiveOverruns = 0;
   private snapshots = 0;
+  private snapshotsPruned = 0;
   private phaseHalts = 0;
   private agentCrashes = 0;
   private readonly quarantined = new Set<AgentId>();
@@ -151,6 +180,8 @@ export class Supervisor {
     this.log = deps.logger.child({ mod: 'supervisor' });
     const every = opts.snapshotEveryTicks;
     this.snapshotEvery = every === undefined ? DEFAULT_SNAPSHOT_EVERY : Math.max(0, Math.floor(every));
+    const retain = opts.snapshotRetain ?? deps.cfg.snapshotRetain ?? DEFAULT_SNAPSHOT_RETAIN;
+    this.snapshotRetain = Number.isFinite(retain) && retain >= 1 ? Math.floor(retain) : DEFAULT_SNAPSHOT_RETAIN;
     this.maxTicks = Math.max(0, Math.floor(opts.maxTicks ?? 0));
     const slice = opts.sleepSliceMs ?? SLEEP_SLICE_MS;
     this.sliceMs = Number.isFinite(slice) && slice > 0 ? slice : SLEEP_SLICE_MS;
@@ -194,7 +225,22 @@ export class Supervisor {
       maxAgentCrashes: this.cfg.limits.maxAgentCrashes,
     });
     this.loopPromise = this.loop().catch((err: unknown) => {
-      this.log.error('supervisor.loop_crashed', { error: err instanceof Error ? err.message : String(err) });
+      // A crashed loop USED to log and return, leaving running=true — so
+      // /readyz said ready, /healthz said 200, ares_up said 1 and the Docker
+      // healthcheck stayed green over a swarm that was dead. The only honest
+      // response is to stop claiming to be alive and latch the kill switch, so
+      // that every gate in the system agrees the swarm has stopped.
+      const message = err instanceof Error ? err.message : String(err);
+      this.running = false;
+      this.loopCrashed = true;
+      this.log.error('supervisor.loop_crashed', { error: message, tick: this.tickNo });
+      try {
+        this.deps.killSwitch.trip(`supervisor loop crashed: ${message}`, { tick: this.tickNo, fatal: true });
+      } catch (tripErr) {
+        this.log.error('supervisor.loop_crash_trip_failed', {
+          error: tripErr instanceof Error ? tripErr.message : String(tripErr),
+        });
+      }
     });
   }
 
@@ -246,7 +292,10 @@ export class Supervisor {
     let verified = false;
     let brokenAtSeq: number | null = null;
     try {
-      const v = this.deps.ledger.verify();
+      // The FULL O(n) check, streamed from the authoritative file. This is one
+      // of exactly two places that pays for it (the other is boot); every
+      // other caller gets the bounded incremental check.
+      const v = this.deps.ledger.verify({ full: true });
       verified = v.ok;
       brokenAtSeq = v.brokenAtSeq ?? null;
       if (!v.ok) this.log.error('supervisor.final_verify_failed', { brokenAtSeq });
@@ -354,6 +403,15 @@ export class Supervisor {
   async runTick(tick: number): Promise<void> {
     const started = this.clock.now();
     this.ticksExecuted += 1;
+    this.externalBlockedThisTick = 0;
+    // WORK, not wall time. The watchdog latches the kill switch after three
+    // consecutive overruns, so whatever it measures is a halt primitive: if it
+    // measured wall time, anything that blocks the shared event loop — an
+    // unauthenticated GET that re-hashes the ledger, say — could stop the
+    // swarm without ever presenting a credential. It therefore measures only
+    // the spans the tick itself is executing in, and subtracts blocking that
+    // another component has declared via noteExternalBlocking().
+    let work = 0;
     this.log.debug('supervisor.tick_begin', { tick });
 
     for (const phase of PHASES) {
@@ -371,17 +429,26 @@ export class Supervisor {
         });
         break;
       }
+      const phaseStart = this.clock.now();
       await this.runPhase(phase, tick);
+      work += Math.max(0, this.clock.now() - phaseStart);
     }
 
+    const drainStart = this.clock.now();
     try {
       await this.deps.bus.drain();
     } catch (err) {
       this.log.error('supervisor.drain_failed', { tick, error: err instanceof Error ? err.message : String(err) });
     }
+    work += Math.max(0, this.clock.now() - drainStart);
 
-    const elapsed = this.clock.now() - started;
+    const wall = this.clock.now() - started;
+    const stolen = this.externalBlockedThisTick;
+    this.externalBlockedThisTick = 0;
+    const elapsed = Math.max(0, work - stolen);
     this.lastTickMs = elapsed;
+    this.lastTickWallMs = wall;
+    this.lastExternalBlockedMs = stolen;
     if (elapsed > this.maxTickMs) this.maxTickMs = elapsed;
     this.checkWatchdog(tick, elapsed);
 
@@ -446,6 +513,25 @@ export class Supervisor {
         });
       }
     }
+  }
+
+  /**
+   * Declare event-loop time that was spent on work which is NOT this tick's —
+   * an HTTP handler, a signal handler, anything sharing the single thread. The
+   * watchdog subtracts it, so external load can slow the swarm down but can
+   * never latch its emergency stop. Callers pass their own measured duration;
+   * a bogus value can only ever make the watchdog MORE forgiving, never make
+   * it trip, which is the safe direction for a caller-supplied number.
+   */
+  noteExternalBlocking(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    this.externalBlockedThisTick += ms;
+    this.externalBlockedTotalMs += ms;
+  }
+
+  /** Total event-loop time other components have declared. Observability only. */
+  get externalBlockedMs(): number {
+    return this.externalBlockedTotalMs;
   }
 
   private checkWatchdog(tick: number, elapsed: number): void {
@@ -520,10 +606,32 @@ export class Supervisor {
     try {
       mkdirSync(dir, { recursive: true });
       const tmp = `${file}.tmp`;
-      writeFileSync(tmp, JSON.stringify(body) + '\n', 'utf8');
+      // Same sequence MemoryStore.flush() uses: open, write, FSYNC, close,
+      // rename. The old code wrote and renamed with no fsync at all, so the
+      // comment above promised a durability guarantee the code did not give:
+      // after a power cut the rename could be visible with no bytes behind it.
+      const sync = this.deps.fsync ?? fsyncSync;
+      const fd = openSync(tmp, 'w');
+      try {
+        writeFileSync(fd, JSON.stringify(body) + '\n', 'utf8');
+        sync(fd);
+      } finally {
+        closeSync(fd);
+      }
       renameSync(tmp, file);
+      try {
+        const dfd = openSync(dir, 'r');
+        try {
+          fsyncSync(dfd);
+        } finally {
+          closeSync(dfd);
+        }
+      } catch {
+        /* directory fsync is not supported everywhere; the file itself is durable */
+      }
       this.snapshots += 1;
-      this.log.info('supervisor.snapshot', { tick, file, memoriesFlushed: flushed });
+      const pruned = this.pruneSnapshots(dir);
+      this.log.info('supervisor.snapshot', { tick, file, memoriesFlushed: flushed, pruned });
       return file;
     } catch (err) {
       this.log.error('supervisor.snapshot_failed', {
@@ -532,6 +640,44 @@ export class Supervisor {
       });
       return null;
     }
+  }
+
+  /**
+   * Keep only the newest `snapshotRetain` snapshots.
+   *
+   * Nothing used to delete these: ~864 files a day, ~315k a year, each holding
+   * full state, on the SAME volume as the ledger. Under read_only:true that
+   * volume is the only writable path in the container, so filling it does not
+   * just lose snapshots — it stops ledger appends, and the audit trail is the
+   * second thing to fail.
+   */
+  private pruneSnapshots(dir: string): number {
+    let removed = 0;
+    try {
+      const files = readdirSync(dir)
+        .filter((f) => f.startsWith(SNAPSHOT_PREFIX) && f.endsWith('.json'))
+        .sort(); // zero-padded tick numbers sort chronologically
+      const excess = files.length - this.snapshotRetain;
+      for (let i = 0; i < excess; i++) {
+        const victim = files[i];
+        if (victim === undefined) continue;
+        try {
+          unlinkSync(join(dir, victim));
+          removed += 1;
+          this.snapshotsPruned += 1;
+        } catch (err) {
+          this.log.warn('supervisor.snapshot_prune_failed', {
+            file: victim,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    } catch (err) {
+      this.log.warn('supervisor.snapshot_prune_list_failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return removed;
   }
 
   snapshot(): SupervisorSnapshot {
@@ -547,20 +693,46 @@ export class Supervisor {
       ticksSkipped: this.ticksSkipped,
       skipEvents: this.skipEvents,
       lastTickMs: this.lastTickMs,
+      lastTickWallMs: this.lastTickWallMs,
+      lastExternalBlockedMs: this.lastExternalBlockedMs,
       maxTickMs: this.maxTickMs,
       overruns: this.overruns,
       consecutiveOverruns: this.consecutiveOverruns,
       watchdogMs: this.cfg.limits.tickWatchdogMs,
       tickIntervalMs: this.cfg.tickIntervalMs,
       nextTickDueAt: this.nextDueAt(),
+      tickOverdueMs: this.tickOverdueMs(),
+      stalled: this.isStalled(),
+      loopCrashed: this.loopCrashed,
       snapshotEveryTicks: this.snapshotEvery,
+      snapshotRetain: this.snapshotRetain,
       snapshots: this.snapshots,
+      snapshotsPruned: this.snapshotsPruned,
       quarantined: [...this.quarantined],
       phaseHalts: this.phaseHalts,
       agentCrashes: this.agentCrashes,
       halted: this.deps.killSwitch.tripped,
       haltReason: this.deps.killSwitch.reason,
     };
+  }
+
+  /** Milliseconds past the current tick's deadline, floored at 0. */
+  tickOverdueMs(): number {
+    const due = this.nextDueAt();
+    if (due === null) return 0;
+    const late = this.clock.now() - due;
+    return late > 0 ? late : 0;
+  }
+
+  /**
+   * True when the loop has missed its deadline by MORE THAN a whole interval,
+   * or has crashed outright. /readyz reports this: a frozen tick counter was
+   * previously the only symptom of a dead swarm, and nobody alerts on that.
+   */
+  isStalled(): boolean {
+    if (this.loopCrashed) return true;
+    if (!this.running || this.shuttingDown || this.stoppedFlag) return false;
+    return this.tickOverdueMs() > this.cfg.tickIntervalMs;
   }
 
   // --------------------------------------------------------------- signals --

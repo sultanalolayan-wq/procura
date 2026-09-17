@@ -1,6 +1,31 @@
 /**
  * agents/seller.ts — the seller. Turns inventory (bought by a scout, or minted
  * at zero cost) into settled cash, and learns price and copy from what sold.
+ *
+ * THE FLOOR MUST KNOW THE REAL FEES (amendment A7). listingFeeByChannel used to
+ * be populated only AFTER a channel's first successful publish, so the FIRST
+ * listing on every channel — and every listing made by a respawned seller —
+ * priced the floor with a listing fee of zero and could certify a round trip
+ * that loses exactly that fee. The fee is now SEEDED from the channel's declared
+ * parameters and remembered across a respawn, so the first listing is costed
+ * like the hundredth. (The other half of that defect lives in the scout, which
+ * now capitalises the buy commission into the unit cost rather than expensing
+ * it, so carryingMinor is the all-in basis.)
+ *
+ * A FILL IS MONEY, EVEN AN AWKWARD ONE (amendment A8). Three changes:
+ *   (a) a successor inherits its predecessor's live offers through the
+ *       registry's handover path, because a terminated seller's listings keep
+ *       filling on the channel and the successor used to drop them;
+ *   (b) an expiry does NOT delete a LiveOffer while a fill may still settle
+ *       against it — the offer is retained, reconciled against the channel's
+ *       authoritative remaining count (listingStatus()), and only released once
+ *       settlement can no longer arrive;
+ *   (c) a fill that is still unmatched after all that is BOOKED to the ledger
+ *       under its own ORPHAN_FILL type rather than dropped, so the cash reaches
+ *       the books, and it is counted in stats() instead of being a lone warn
+ *       line. It is booked without a cost-of-goods leg on purpose: the basis is
+ *       genuinely unknown, and inventing one would be worse than admitting it.
+ *
  * Invariants: an offer is NEVER published below cost of goods + fees unless the
  * holding is past its TTL, in which case the shortfall is an explicit, logged
  * writeoff to the `writeoff` account BEFORE the listing goes up; offers are keyed
@@ -11,6 +36,7 @@
 
 import { PolicyDenied } from '../core/errors.js';
 import { idempotencyKey } from '../core/ids.js';
+import type { Leg } from '../core/ledger.js';
 import { money, mul, type Minor, type Money } from '../core/money.js';
 import type { AgentId, Fill, Holding, Offer, Opportunity } from '../core/types.js';
 import type { Envelope } from '../bus/protocol.js';
@@ -84,6 +110,27 @@ function asExpiryCapable(a: ChannelAdapter): ExpiryCapable | null {
 function asMintCapable(a: ChannelAdapter): MintCapable | null {
   const probe = a as unknown as Partial<MintCapable>;
   return typeof probe.mint === 'function' ? (probe as MintCapable) : null;
+}
+
+/** What a channel charges to put a listing up, when it says so up front. */
+interface ListingFeeCapable {
+  readonly params: { listingFeeMinor: number };
+}
+
+function declaredListingFee(a: ChannelAdapter): Minor | null {
+  const probe = a as unknown as Partial<ListingFeeCapable>;
+  const fee = probe.params?.listingFeeMinor;
+  return typeof fee === 'number' && Number.isFinite(fee) && fee >= 0 ? Math.floor(fee) : null;
+}
+
+/** The channel's own answer to "is this listing still live, and how much of it?" */
+interface ListingStatusCapable {
+  listingStatus(offerId: string): { remaining: number; listedTick: number; expiresTick: number; priceMinor: Minor } | null;
+}
+
+function asListingStatusCapable(a: ChannelAdapter): ListingStatusCapable | null {
+  const probe = a as unknown as Partial<ListingStatusCapable>;
+  return typeof probe.listingStatus === 'function' ? (probe as ListingStatusCapable) : null;
 }
 
 /* ------------------------------------------------------------- the floor rule */
@@ -166,13 +213,38 @@ interface LiveOffer {
   traceId: string | null;
   listedTick: number;
   attempts: number;
+  /**
+   * The tick the channel said this listing expired, or null while it is live.
+   * A non-null value with remaining > 0 means the offer is being RETAINED: it is
+   * off the market but a fill sold before expiry may still be settling, and the
+   * offer is the only thing that can identify that fill when it lands.
+   */
+  expiredTick: number | null;
+  /** Units the channel reports as sold-but-unsettled at expiry time. */
+  pendingUnits: number;
+  /** True for an offer adopted from a terminated predecessor. */
+  inherited: boolean;
 }
+
+/**
+ * Ticks an expired offer with unsettled units is retained before the seller
+ * gives up on the fill ever arriving. The longest settlementDelayTicks of the
+ * configured channels is 5; this is a generous multiple of it, because the cost
+ * of waiting is a holding that cannot be re-listed for a few ticks and the cost
+ * of not waiting is lost revenue plus phantom inventory.
+ */
+export const SETTLEMENT_GRACE_TICKS = 12;
+
+/** Fact key the seller's live offers are handed to a successor under. */
+export const LIVE_OFFERS_FACT = 'seller.liveOffers';
 
 export interface SellerOptions {
   variants?: readonly string[];
   /** Maximum holdings the seller will mint ahead of demand. */
   maxMintedHoldings?: number;
   style?: Partial<SellerStyle>;
+  /** Ticks an expired offer with unsettled units is retained. */
+  settlementGraceTicks?: number;
 }
 
 export class SellerAgent extends BaseAgent {
@@ -186,11 +258,17 @@ export class SellerAgent extends BaseAgent {
   /** Re-list attempts per holding, so a dud is eventually given up on. */
   private readonly attempts = new Map<string, number>();
   private readonly listingFeeByChannel = new Map<string, Minor>();
+  private readonly settlementGrace: number;
   private offerSeq = 0;
   private published = 0;
   private sold = 0;
   private refusedBelowCost = 0;
   private writeoffs = 0;
+  private orphanFills = 0;
+  private orphanUnits = 0;
+  private orphanRevenueMinor: Minor = 0;
+  private inheritedOffers = 0;
+  private retainedOffers = 0;
 
   constructor(id: AgentId, strategyId: string, deps: AgentDeps, opts: SellerOptions = {}) {
     super(id, 'seller', strategyId, deps);
@@ -207,7 +285,77 @@ export class SellerAgent extends BaseAgent {
     this.priceLearner =
       savedPrices === null ? new PriceLearner(deps.rng) : PriceLearner.fromJSON(savedPrices, deps.rng);
 
+    const grace = opts.settlementGraceTicks;
+    this.settlementGrace =
+      typeof grace === 'number' && Number.isSafeInteger(grace) && grace >= 0 ? grace : SETTLEMENT_GRACE_TICKS;
+
+    // A respawned seller must not re-learn what every channel charges to list.
+    const savedFees = deps.memory.getFact<Record<string, number>>('seller.listingFees', {});
+    if (savedFees !== null && typeof savedFees === 'object') {
+      for (const [ch, fee] of Object.entries(savedFees)) {
+        if (typeof fee === 'number' && Number.isFinite(fee) && fee >= 0) this.listingFeeByChannel.set(ch, Math.floor(fee));
+      }
+    }
+
+    this.adoptInheritedOffers();
     this.subscribe(['INVENTORY_ADDED'], (e) => this.onInventoryAdded(e));
+  }
+
+  /**
+   * Take over a terminated predecessor's live listings. Those listings are still
+   * on the channel and still filling; without this the successor does not
+   * recognise the offerId a fill names, so the revenue is lost, the buyer that
+   * sourced the unit is punished for a sale that DID happen, and the channel's
+   * stock and the swarm's books disagree for the rest of the run.
+   */
+  private adoptInheritedOffers(): void {
+    let handover: Record<string, unknown> = {};
+    try {
+      handover = this.deps.memory.getFact<Record<string, unknown>>('inheritedHandover', {}) ?? {};
+    } catch (err) {
+      this.log.error('seller.handover_read_failed', { error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    const raw = handover[LIVE_OFFERS_FACT];
+    if (!Array.isArray(raw)) return;
+    for (const item of raw) {
+      const o = item as Partial<LiveOffer>;
+      if (o === null || typeof o !== 'object' || typeof o.offerId !== 'string' || o.offerId.length === 0) continue;
+      if (this.offers.has(o.offerId)) continue;
+      const live: LiveOffer = {
+        offerId: o.offerId,
+        channel: String(o.channel ?? ''),
+        sku: String(o.sku ?? ''),
+        holdingId: String(o.holdingId ?? ''),
+        qty: numberOr(o.qty, 0),
+        remaining: numberOr(o.remaining, 0),
+        priceMinor: numberOr(o.priceMinor, 0),
+        multiplier: typeof o.multiplier === 'number' && Number.isFinite(o.multiplier) ? o.multiplier : 1,
+        variant: String(o.variant ?? 'plain'),
+        unitCostMinor: numberOr(o.unitCostMinor, 0),
+        traceId: typeof o.traceId === 'string' ? o.traceId : null,
+        listedTick: numberOr(o.listedTick, 0),
+        attempts: numberOr(o.attempts, 0),
+        expiredTick: typeof o.expiredTick === 'number' ? o.expiredTick : null,
+        pendingUnits: numberOr(o.pendingUnits, 0),
+        inherited: true,
+      };
+      if (live.remaining <= 0) continue;
+      this.offers.set(live.offerId, live);
+      this.inheritedOffers++;
+    }
+    if (this.inheritedOffers > 0) {
+      this.log.warn('seller.offers_inherited', {
+        count: this.inheritedOffers,
+        offerIds: [...this.offers.keys()],
+        reason: 'a predecessor died with listings still live on the channel; its fills are this agent to book',
+      });
+    }
+  }
+
+  /** The registry's handover hook: what is still live on the channels. */
+  override handoverState(): Record<string, unknown> {
+    return { [LIVE_OFFERS_FACT]: this.liveOffers() };
   }
 
   get prices(): PriceLearner {
@@ -222,7 +370,22 @@ export class SellerAgent extends BaseAgent {
     return [...this.offers.values()].map((o) => ({ ...o }));
   }
 
-  stats(): { published: number; sold: number; refusedBelowCost: number; writeoffs: number; openOffers: number; holdings: number } {
+  stats(): {
+    published: number;
+    sold: number;
+    refusedBelowCost: number;
+    writeoffs: number;
+    openOffers: number;
+    holdings: number;
+    /** Fills booked with no offer to match them (amendment A8c). */
+    orphanFills: number;
+    orphanUnits: number;
+    orphanRevenueMinor: Minor;
+    /** Live listings adopted from a terminated predecessor. */
+    inheritedOffers: number;
+    /** Expired listings retained because a fill may still settle. */
+    retainedOffers: number;
+  } {
     return {
       published: this.published,
       sold: this.sold,
@@ -230,6 +393,11 @@ export class SellerAgent extends BaseAgent {
       writeoffs: this.writeoffs,
       openOffers: this.offers.size,
       holdings: this.inventory.size,
+      orphanFills: this.orphanFills,
+      orphanUnits: this.orphanUnits,
+      orphanRevenueMinor: this.orphanRevenueMinor,
+      inheritedOffers: this.inheritedOffers,
+      retainedOffers: this.retainedOffers,
     };
   }
 
@@ -290,15 +458,18 @@ export class SellerAgent extends BaseAgent {
   private bookFill(channel: string, f: Fill): void {
     const live = this.offers.get(f.offerId);
     if (live === undefined) {
-      // Not ours (or already reconciled). Never invent inventory to match a fill.
-      this.log.warn('seller.orphan_fill', { channel, offerId: f.offerId, qty: f.qty });
+      this.bookOrphanFill(channel, f);
       return;
     }
     const qty = Math.max(0, Math.min(f.qty, live.remaining));
     if (qty === 0) return;
     const grossMinor = f.unitPrice.amount * qty;
     const feeMinor = Math.max(0, f.feeMinor);
-    const cogsMinor = live.unitCostMinor * qty;
+    // An INHERITED offer has no cost basis left to relieve: its predecessor's
+    // terminate() already wrote the holding off against `writeoff` at its
+    // carrying value. Charging cost of goods again would credit the inventory
+    // account a second time and book the same loss twice.
+    const cogsMinor = live.inherited ? 0 : live.unitCostMinor * qty;
     const proceedsMinor = grossMinor - feeMinor;
     const netMinor = proceedsMinor - cogsMinor;
 
@@ -314,8 +485,12 @@ export class SellerAgent extends BaseAgent {
         { account: 'cash', amount: proceedsMinor },
         { account: 'fees', amount: feeMinor },
         { account: 'revenue', amount: -grossMinor },
-        { account: 'cogs', amount: cogsMinor },
-        { account: 'inventory', amount: -cogsMinor },
+        ...(cogsMinor > 0
+          ? ([
+              { account: 'cogs', amount: cogsMinor },
+              { account: 'inventory', amount: -cogsMinor },
+            ] as Leg[])
+          : []),
       ],
       idempotencyKey: idempotencyKey(['seller.sale', this.id, f.offerId, f.tick, qty, f.unitPrice.amount]),
       meta: {
@@ -328,6 +503,8 @@ export class SellerAgent extends BaseAgent {
         variant: live.variant,
         multiplier: live.multiplier,
         settlementTick: f.tick,
+        inheritedOffer: live.inherited,
+        expiredTick: live.expiredTick,
       },
     });
 
@@ -383,6 +560,90 @@ export class SellerAgent extends BaseAgent {
     this.persist();
   }
 
+  /**
+   * A fill whose offer this seller does not know. It still happened: the channel
+   * took the money and the units are gone. Dropping it — which is what used to
+   * happen, behind a single warn line — lost real revenue, left the inventory
+   * account overstating stock that had already been sold, let the holding be
+   * re-listed for units that no longer existed, and made the scout that sourced
+   * the winner force-resolve its trade as a total loss.
+   *
+   * So it is BOOKED, under its own type, with no cost-of-goods leg: the basis is
+   * genuinely unknown and a made-up cogs figure would corrupt margin for every
+   * downstream reader. Revenue and cash are exact; the missing basis is visible
+   * in the type and the counter rather than smuggled into the numbers.
+   */
+  private bookOrphanFill(channel: string, f: Fill): void {
+    const qty = Math.max(0, f.qty);
+    const grossMinor = Math.max(0, f.unitPrice.amount) * qty;
+    const feeMinor = Math.max(0, f.feeMinor);
+    const proceedsMinor = grossMinor - feeMinor;
+    if (qty === 0 || grossMinor === 0) {
+      this.log.warn('seller.orphan_fill_empty', { channel, offerId: f.offerId, qty: f.qty });
+      return;
+    }
+    this.orphanFills++;
+    this.orphanUnits += qty;
+    this.orphanRevenueMinor += proceedsMinor;
+    try {
+      this.deps.ledger.append({
+        tick: f.tick,
+        type: 'ORPHAN_FILL',
+        agentId: this.id,
+        currency: this.cfg.baseCurrency,
+        legs: [
+          { account: 'cash', amount: proceedsMinor },
+          { account: 'fees', amount: feeMinor },
+          { account: 'revenue', amount: -grossMinor },
+        ],
+        idempotencyKey: idempotencyKey(['seller.orphanFill', this.id, f.offerId, f.tick, qty, f.unitPrice.amount]),
+        meta: {
+          channel,
+          offerId: f.offerId,
+          qty,
+          unitPriceMinor: f.unitPrice.amount,
+          settlementTick: f.tick,
+          reason:
+            'a fill arrived for an offer this seller does not hold — a predecessor listing, or one ' +
+            'already reconciled. Booked without cost of goods because the basis is unknown.',
+        },
+      });
+    } catch (err) {
+      this.log.error('seller.orphan_fill_book_failed', {
+        channel,
+        offerId: f.offerId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    this.log.warn('seller.orphan_fill', {
+      channel,
+      offerId: f.offerId,
+      qty,
+      grossMinor,
+      feeMinor,
+      proceedsMinor,
+      orphanFills: this.orphanFills,
+    });
+    this.emit('SALE_FILLED', {
+      channel,
+      offerId: f.offerId,
+      holdingId: null,
+      sku: null,
+      qty,
+      unitPriceMinor: f.unitPrice.amount,
+      grossMinor,
+      feeMinor,
+      cogsMinor: 0,
+      proceedsMinor,
+      netMinor: proceedsMinor,
+      remaining: 0,
+      disposition: 'orphan',
+      traceId: null,
+      tick: f.tick,
+    });
+  }
+
   private observeFeeBps(channel: string, grossMinor: Minor, feeMinor: Minor): void {
     if (grossMinor <= 0) return;
     this.deps.memory.observe(`feeBps:${channel}`, (feeMinor * 10_000) / grossMinor);
@@ -417,13 +678,45 @@ export class SellerAgent extends BaseAgent {
       }
       for (const x of expired) this.handleExpiry(name, x, tick);
     }
+    this.reconcileRetained(tick);
   }
 
+  /**
+   * An expiry notice is authoritative about what did NOT sell, not about what
+   * did. If the channel says fewer units remain than this seller still has on
+   * the offer, the difference SOLD and its cash is somewhere between the sale
+   * and settlement — measured at 12 of 399 seeds. Deleting the LiveOffer there
+   * and then throws away the only thing that can recognise that fill when it
+   * lands: the revenue is lost, the inventory account overstates the stock, and
+   * the holding gets re-listed for units that are already gone.
+   *
+   * So the offer is RETAINED when units are unaccounted for, and released
+   * immediately when the channel's count agrees with ours — which is the common
+   * case and keeps a genuinely unsold holding moving back onto the market at the
+   * next tick, marked down.
+   */
   private handleExpiry(channel: string, x: ExpiredListing, tick: number): void {
     const live = this.offers.get(x.offerId);
     if (live === undefined) return;
-    this.offers.delete(x.offerId);
-    this.offerByHolding.delete(live.holdingId);
+
+    // The channel's own view wins over the notice's snapshot where both exist.
+    const adapter = this.deps.channels.get(channel);
+    const statusCap = adapter === undefined ? null : asListingStatusCapable(adapter);
+    let authoritative = Math.max(0, x.remaining);
+    if (statusCap !== null) {
+      try {
+        const st = statusCap.listingStatus(x.offerId);
+        if (st !== null) authoritative = Math.max(0, st.remaining);
+      } catch (err) {
+        this.log.debug('seller.listing_status_failed', {
+          channel,
+          offerId: x.offerId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    const pending = Math.max(0, live.remaining - authoritative);
+
     // The price step that FAILED to sell — the other half of the price signal.
     this.priceLearner.observe(live.sku, live.multiplier, false);
     try {
@@ -432,7 +725,6 @@ export class SellerAgent extends BaseAgent {
       /* an unknown variant cannot be learned from; the listing is still handled */
     }
 
-    const rec = this.inventory.get(live.holdingId);
     const attempts = (this.attempts.get(live.holdingId) ?? 0) + 1;
     this.attempts.set(live.holdingId, attempts);
     this.log.info('seller.listing_expired', {
@@ -440,15 +732,62 @@ export class SellerAgent extends BaseAgent {
       offerId: x.offerId,
       sku: x.sku,
       remaining: x.remaining,
+      authoritativeRemaining: authoritative,
+      pendingUnits: pending,
       attempts,
       priceMinor: x.priceMinor,
     });
+
+    if (pending > 0) {
+      // Off the market, but not off the books: a fill is still in flight.
+      live.expiredTick = tick;
+      live.pendingUnits = pending;
+      this.retainedOffers++;
+      this.log.warn('seller.offer_retained', {
+        channel,
+        offerId: x.offerId,
+        pendingUnits: pending,
+        graceTicks: this.settlementGrace,
+        reason: 'the channel reports fewer units left than we hold on this offer, so a fill is still settling',
+      });
+      return;
+    }
+
+    this.releaseOffer(live);
+    const rec = this.inventory.get(live.holdingId);
     if (rec === undefined) return;
     if (attempts >= MAX_RELIST_ATTEMPTS) {
       this.abandon(live.holdingId, tick, `abandoned after ${attempts} unsold listings`);
     }
     // Otherwise the holding simply returns to the listing queue next tick, where
     // the decay in listOne() marks it down.
+  }
+
+  /** Drop a retained offer once settlement can no longer plausibly arrive. */
+  private reconcileRetained(tick: number): void {
+    for (const live of [...this.offers.values()]) {
+      if (live.expiredTick === null) continue;
+      if (tick - live.expiredTick < this.settlementGrace) continue;
+      this.log.warn('seller.offer_retention_expired', {
+        channel: live.channel,
+        offerId: live.offerId,
+        pendingUnits: live.pendingUnits,
+        remaining: live.remaining,
+        heldTicks: tick - live.expiredTick,
+        reason: 'the settlement window closed with the fill unaccounted for; releasing the holding to be re-listed',
+      });
+      this.releaseOffer(live);
+      const attempts = this.attempts.get(live.holdingId) ?? 0;
+      if (attempts >= MAX_RELIST_ATTEMPTS && this.inventory.has(live.holdingId)) {
+        this.abandon(live.holdingId, tick, `abandoned after ${attempts} unsold listings`);
+      }
+    }
+  }
+
+  /** Take an offer off the books and free its holding for re-listing. */
+  private releaseOffer(live: LiveOffer): void {
+    this.offers.delete(live.offerId);
+    if (this.offerByHolding.get(live.holdingId) === live.offerId) this.offerByHolding.delete(live.holdingId);
   }
 
   // ------------------------------------------------------------------- mint --
@@ -543,7 +882,7 @@ export class SellerAgent extends BaseAgent {
     // 3. THE FLOOR. Below cogs + fees is refused unless the holding is past TTL.
     const carryingMinor = rec.unitCostMinor * qty;
     const proceedsMinor = priceMinor * qty;
-    const listingFeeMinor = this.listingFeeByChannel.get(channel) ?? 0;
+    const listingFeeMinor = this.listingFeeFor(channel, adapter);
     const sellFeeMinor = Math.ceil((proceedsMinor * this.feeBps(channel)) / 10_000);
     const ageTicks = tick - rec.acquiredTick;
     const decision = listingDecision({
@@ -609,7 +948,7 @@ export class SellerAgent extends BaseAgent {
 
     const idem = idempotencyKey(['seller.publish', this.id, channel, offer.id, tick]);
     const { offerId, feeMinor } = await adapter.publish(offer, tick, idem);
-    this.listingFeeByChannel.set(channel, Math.max(0, feeMinor));
+    this.rememberListingFee(channel, Math.max(0, feeMinor));
     if (feeMinor > 0) {
       this.deps.ledger.append({
         tick,
@@ -639,6 +978,9 @@ export class SellerAgent extends BaseAgent {
       traceId: current.traceId,
       listedTick: tick,
       attempts,
+      expiredTick: null,
+      pendingUnits: 0,
+      inherited: false,
     };
     this.offers.set(offerId, live);
     this.offerByHolding.set(holdingId, offerId);
@@ -659,6 +1001,32 @@ export class SellerAgent extends BaseAgent {
       tick,
     });
     this.persist();
+  }
+
+  /**
+   * What listing on this channel costs. OBSERVED first, then the channel's own
+   * declared parameter, then zero. The declared value is what makes the FIRST
+   * listing on a channel — and every listing by a successor that has never
+   * published — cost the floor honestly instead of assuming listing is free.
+   */
+  private listingFeeFor(channel: string, adapter: ChannelAdapter): Minor {
+    const observed = this.listingFeeByChannel.get(channel);
+    if (observed !== undefined) return observed;
+    const declared = declaredListingFee(adapter);
+    if (declared !== null) {
+      this.listingFeeByChannel.set(channel, declared);
+      return declared;
+    }
+    return 0;
+  }
+
+  private rememberListingFee(channel: string, feeMinor: Minor): void {
+    this.listingFeeByChannel.set(channel, feeMinor);
+    try {
+      this.deps.memory.setFact('seller.listingFees', Object.fromEntries(this.listingFeeByChannel));
+    } catch (err) {
+      this.log.debug('seller.listing_fee_persist_failed', { error: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   // ---------------------------------------------------------------- writeoff --
@@ -736,7 +1104,9 @@ export class SellerAgent extends BaseAgent {
     const written = this.writeOff(holdingId, rec.remaining * rec.unitCostMinor, tick, reason);
     this.inventory.delete(holdingId);
     const live = this.offerByHolding.get(holdingId);
-    if (live !== undefined) this.offers.delete(live);
+    // A RETAINED offer stays: its fill may still land, and booking that cash is
+    // worth more than the tidiness of deleting the record that recognises it.
+    if (live !== undefined && this.offers.get(live)?.expiredTick === null) this.offers.delete(live);
     this.offerByHolding.delete(holdingId);
     this.attempts.delete(holdingId);
     this.emit('SALE_FILLED', {
@@ -776,6 +1146,10 @@ export class SellerAgent extends BaseAgent {
     this.deps.memory.setFact('seller.variantWeights', this.variantBandit.weights());
     this.deps.memory.flush();
   }
+}
+
+function numberOr(v: unknown, d: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : d;
 }
 
 /** Factory shape the registry uses when it respawns a seller. */

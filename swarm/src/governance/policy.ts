@@ -151,17 +151,38 @@ export class PolicyEngine {
     if (!c.canBuy && !c.canSell) {
       this.denyAt(t, subject, RULES.CHANNEL_USELESS, `channel ${name} can neither buy nor sell`, {});
     }
+    // The rule is about an INTERNALLY INCONSISTENT capability set, not about the
+    // channel as a whole. An adapter that declares canBuy while its own ToS note
+    // says every purchase needs a human, with no approval channel wired, is
+    // claiming a capability it cannot lawfully exercise — that is refused.
+    //
+    // An adapter that declares canBuy:FALSE and buyRequiresHumanApproval:true is
+    // NOT inconsistent: it is an honest sell-only channel that is recording why
+    // it has no buy path. Denying the whole adapter for that was the reason the
+    // ksa_ecom sell path, its SAR pricing and its VAT handling never ran at all.
     if (c.canBuy && c.buyRequiresHumanApproval && this.approvalChannel === null) {
-      this.denyAt(t, subject, RULES.CHANNEL_APPROVAL, `channel ${name} claims canBuy while its terms of service require human approval per purchase (${c.tosNote}), and no approval channel is configured — the capability set is internally inconsistent for an autonomous agent`, {
+      this.denyAt(t, subject, RULES.CHANNEL_APPROVAL, `channel ${name} claims canBuy while its terms of service require human approval per purchase (${c.tosNote}), and no approval channel is configured — the capability set is internally inconsistent for an autonomous agent. An adapter with no automated buy path must declare canBuy:false; it is then admitted SELL-ONLY`, {
         tosNote: c.tosNote,
         jurisdiction: c.jurisdiction,
+        remedy: 'declare canBuy:false to be admitted as a sell-only channel',
       });
     }
-    this.allow(t, subject, RULES.CHANNEL_OK, `channel ${name} admitted`, {
-      canBuy: c.canBuy,
-      canSell: c.canSell,
-      jurisdiction: c.jurisdiction,
-    });
+    const sellOnly = !c.canBuy && c.canSell;
+    this.allow(
+      t,
+      subject,
+      RULES.CHANNEL_OK,
+      sellOnly ? `channel ${name} admitted SELL-ONLY (it declares no automated buy path)` : `channel ${name} admitted`,
+      {
+        canBuy: c.canBuy,
+        canSell: c.canSell,
+        sellOnly,
+        // True on a sell-only channel means "this is why there is no buy path",
+        // not "buying is pending an approval that might arrive".
+        buyRequiresHumanApproval: c.buyRequiresHumanApproval,
+        jurisdiction: c.jurisdiction,
+      },
+    );
   }
 
   /**

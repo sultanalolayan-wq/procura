@@ -9,10 +9,10 @@
  * a silently idle swarm. Callers: src/index.ts, tests.
  */
 
-import { mkdirSync } from 'node:fs';
-import { resolve as resolvePath } from 'node:path';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join, resolve as resolvePath } from 'node:path';
 
-import { AresError, PolicyDenied } from '../core/errors.js';
+import { AresError, IntegrityError, PolicyDenied } from '../core/errors.js';
 import { systemClock, type Clock } from '../core/clock.js';
 import { createLogger, type Logger } from '../core/logger.js';
 import { makeRng } from '../core/rng.js';
@@ -36,7 +36,7 @@ import { ScoutAgent, SCOUT_STRATEGIES } from '../agents/scout.js';
 import { SellerAgent, SELLER_STRATEGIES } from '../agents/seller.js';
 import { TreasuryAgent, treasuryFactory } from '../agents/treasury.js';
 import { ApiServer } from '../api/server.js';
-import { Supervisor, DEFAULT_SNAPSHOT_EVERY } from './supervisor.js';
+import { Supervisor } from './supervisor.js';
 
 /** Channel name -> constructor. The only three channels that exist. */
 const CHANNEL_BUILDERS: Readonly<Record<string, (sim: MarketSimulator, p: { currency: 'SAR' | 'USD' }) => ChannelAdapter>> =
@@ -60,7 +60,7 @@ export interface BootstrapOptions {
   startApi?: boolean;
   /** Install SIGINT/SIGTERM handlers on the supervisor. Default false. */
   installSignalHandlers?: boolean;
-  /** Ticks between state snapshots; ARES_SNAPSHOT_EVERY when omitted. */
+  /** Ticks between state snapshots; cfg.snapshotEveryTicks when omitted. */
   snapshotEveryTicks?: number;
   /** Stop after N ticks (tests). */
   maxTicks?: number;
@@ -97,12 +97,20 @@ export interface Ares {
   shutdown: (reason?: string) => Promise<void>;
 }
 
-/** Read ARES_SNAPSHOT_EVERY without touching the frozen core config. */
-function snapshotEveryFromEnv(env: NodeJS.ProcessEnv): number {
-  const raw = (env['ARES_SNAPSHOT_EVERY'] ?? '').trim();
-  if (raw === '') return DEFAULT_SNAPSHOT_EVERY;
-  if (!/^\d+$/.test(raw)) return DEFAULT_SNAPSHOT_EVERY;
-  return Number(raw);
+/**
+ * Exit code for "the ledger on disk is not a valid chain". Distinct from an
+ * ordinary crash so that `restart: unless-stopped` does not turn a corrupt
+ * audit trail into a silent, permanent crash loop that looks like any other
+ * flap. A sentinel file is written beside the ledger for the same reason.
+ */
+export const EXIT_LEDGER_CORRUPT = 3;
+
+/** Written into the data directory when the ledger refuses to open. */
+export const LEDGER_SENTINEL_FILE = 'LEDGER_CORRUPT';
+
+/** Process exit code for a startup failure, by kind. */
+export function startupExitCode(err: unknown): number {
+  return err instanceof IntegrityError ? EXIT_LEDGER_CORRUPT : 1;
 }
 
 /**
@@ -126,7 +134,46 @@ export async function bootstrap(cfg: AresConfig, opts: BootstrapOptions = {}): P
   });
 
   // 1. The books come first: everything below writes to them.
-  const ledger = Ledger.open(dataDir, clock, logger);
+  //
+  // REFUSING to open a broken chain is correct and stays. What is added is
+  // visibility: a sentinel file and a distinct exit code, so an operator can
+  // tell "the audit trail is corrupt, stop restarting me" apart from an
+  // ordinary crash under `restart: unless-stopped`.
+  let ledger: Ledger;
+  try {
+    ledger = Ledger.open(dataDir, clock, logger);
+  } catch (err) {
+    if (err instanceof IntegrityError) {
+      const sentinel = join(dataDir, LEDGER_SENTINEL_FILE);
+      try {
+        writeFileSync(
+          sentinel,
+          JSON.stringify(
+            {
+              code: err.code,
+              message: err.message,
+              meta: err.meta ?? {},
+              at: clock.now(),
+              exitCode: EXIT_LEDGER_CORRUPT,
+              note:
+                'ARES refused to open the ledger because its hash chain does not verify. ' +
+                'This file is written on every such refusal. Restarting will NOT fix it: ' +
+                'inspect ledger.jsonl at the seq named above, then move it aside deliberately.',
+            },
+            null,
+            2,
+          ) + '\n',
+          'utf8',
+        );
+      } catch (writeErr) {
+        log.error('boot.ledger_sentinel_write_failed', {
+          error: writeErr instanceof Error ? writeErr.message : String(writeErr),
+        });
+      }
+      log.error('boot.ledger_corrupt', { code: err.code, brokenAtSeq: err.meta?.['brokenAtSeq'] ?? null, sentinel });
+    }
+    throw err;
+  }
 
   // 2. The kill switch, and the file an operator can create to stop the swarm
   //    without an API token at all.
@@ -315,7 +362,8 @@ export async function bootstrap(cfg: AresConfig, opts: BootstrapOptions = {}): P
       ...(opts.exit ? { exit: opts.exit } : {}),
     },
     {
-      snapshotEveryTicks: opts.snapshotEveryTicks ?? snapshotEveryFromEnv(process.env),
+      snapshotEveryTicks: opts.snapshotEveryTicks ?? cfg.snapshotEveryTicks,
+      snapshotRetain: cfg.snapshotRetain,
       ...(opts.maxTicks !== undefined ? { maxTicks: opts.maxTicks } : {}),
     },
   );
