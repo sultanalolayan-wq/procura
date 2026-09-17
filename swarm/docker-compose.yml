@@ -1,0 +1,62 @@
+# ARES — PAPER mode only. One service, one named volume for state.
+#
+# The API is published to 127.0.0.1 ONLY. Change that line and you are exposing
+# a control surface that can halt the swarm; if you do, you must also set
+# ARES_API_TOKEN, and the process will refuse to start if you have not.
+
+services:
+  ares:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ares-swarm:local
+    container_name: ares
+    restart: unless-stopped
+    # PID 1 signal semantics: tini reaps children and forwards SIGTERM, so the
+    # supervisor's graceful shutdown always runs.
+    init: true
+    env_file:
+      - .env
+    environment:
+      # Inside the container the process binds all interfaces; the ports mapping
+      # below is what actually decides who can reach it.
+      ARES_MODE: PAPER
+      ARES_DATA_DIR: /app/var
+      ARES_API_HOST: 0.0.0.0
+      ARES_API_PORT: "8787"
+    ports:
+      # host:container — loopback on the host by default. Deliberate.
+      - "127.0.0.1:8787:8787"
+    volumes:
+      # The ledger, the memory stores and the snapshots. Losing this loses the
+      # audit trail, so it is a named volume, not a container-lifetime layer.
+      - ares-var:/app/var
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 256
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ares-var:
