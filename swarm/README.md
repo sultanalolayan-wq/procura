@@ -8,12 +8,31 @@ survival rule, wired into a loop that is meant to survive weeks unattended.
 
 ## PAPER mode only — read this first
 
-**ARES runs in PAPER mode and nothing else.** Every market, price, fill and fee
-comes from a deterministic simulator in `src/channels/`. No real funds move, no
-real order is ever placed, and no real exchange, marketplace or payment provider
-is contacted. `ARES_MODE` accepts exactly one value, `PAPER`; any other value
-makes the process refuse to start. LIVE execution is a *declared-but-refused*
-path — see [What live execution would require](#what-live-execution-would-require).
+**ARES runs in PAPER mode and nothing else.** Every fill and fee comes from a
+model inside this process — the deterministic simulator in `src/channels/` for
+the synthetic channels, and a local fill model against real historical bars for
+the equities channel. No real funds move and no real order is ever placed. `ARES_MODE` accepts exactly one value, `PAPER`; any other
+value makes the process refuse to start. LIVE execution is a
+*declared-but-refused* path — see
+[What live execution would require](#what-live-execution-would-require).
+
+**The network boundary, stated precisely.** This used to read "no real exchange,
+marketplace or payment provider is contacted", full stop. That sentence is no
+longer true without qualification, and leaving it standing would have been the
+more comfortable choice rather than the honest one. The market module
+(`src/market/`) can read real prices, so the claim is now narrower and more
+specific:
+
+| | |
+|---|---|
+| **Outbound writes** | None. No POST, PUT, PATCH or DELETE exists anywhere in this repository. The market HTTP client exposes a single `get()` and refuses every other verb by name. |
+| **Outbound reads** | `src/market/http.ts` only, GET only, HTTPS only, to hosts named in `ARES_MARKET_HOSTS` (**empty by default — deny everything**), with a timeout, a response-size ceiling, a bounded redirect count re-checked against the same allowlist, and the existing circuit breaker and rate limiter in front. |
+| **Orders** | Never leave the process. Fills are computed locally in `src/channels/equities.ts` against the bars a feed returned. There is no code path from an order to a socket, and `test/equities.test.ts` walks the **built** JavaScript of the execution path asserting that no network module and no write verb appears on it. |
+| **Brokers, exchanges, payment rails** | Still not contacted, at all, ever. Reading a price from a data provider is not the same act as sending an order to a venue, and this system only does the first. |
+
+The default configuration reaches nothing: `ARES_MARKET_ENABLED` is off, the host
+allowlist is empty, and the feed that is actually used here (`CsvFeed`) reads
+files from disk.
 
 The numbers on the dashboard and in `/api/report` are the output of a simulation.
 They are **not evidence of profitability** and must not be presented as a track
@@ -441,6 +460,139 @@ l.close();"
 `sum` must be `0`. If `Ledger.open` throws `LEDGER_CHAIN_BROKEN` or
 `LEDGER_TRUNCATED`, the file was tampered with or the process died mid-append;
 do not "repair" it — keep it as evidence and start a new data directory.
+
+---
+
+## Paper-trading against REAL prices (`src/market/`)
+
+The equities channel prices its fills from **real bars** — S&P 500 names on the
+US venue, Tadawul names on the Saudi one — while remaining paper throughout. It
+is off by default. Everything below is what an operator must supply and must
+know before the numbers mean anything.
+
+### The one rule that matters: no lookahead
+
+A decision taken at the close of session **D** can only be filled on session
+**D+1**. A market order fills at D+1's *open*, never at the close it was decided
+on. A limit order fills only if D+1's actual `[low, high]` range contains the
+limit, and slippage can never push a fill through its own limit. Every fill is
+clamped into the real bar's range, because a price outside the bar did not
+happen.
+
+This is enforced in four independent places, because a backtest that fills on the
+bar it decided on is the single most common way this kind of system lies, and
+every number it then produces is worthless:
+
+1. `EquitiesChannel` prices fills only from `sessionDay(tick + 1)` and refuses,
+   with `MARKET_LOOKAHEAD_REFUSED`, any bar that is not strictly after the
+   decision session — even if a feed hands it one.
+2. `scan()` hands the agent history that stops at the decision close.
+3. After an order has executed at a tick, further decision calls at that same
+   tick are refused (`MARKET_DECISION_AFTER_EXECUTION`), so an agent cannot learn
+   tomorrow's open from its own fill and then re-decide today.
+4. `AsOfFeed` (`src/market/feed.ts`) is a feed wrapper that *cannot* return a bar
+   after its seal and never rewinds.
+
+`test/equities.test.ts` contains a test built so that same-bar execution would
+pass everything else and fail only it: a limit that D0's range contains and D1's
+range does not **must not** fill, while a limit that only D1's range contains
+**must**.
+
+### What the operator supplies
+
+**Price files.** `CsvFeed` reads `<ARES_DATA_DIR>/market/<venue>/<symbol>.csv`
+(venue lower-cased: `us`, `tadawul`), header exactly:
+
+```
+date,open,high,low,close,volume
+2025-01-02,100.00,101.50,99.25,100.75,1000
+```
+
+Dates are `YYYY-MM-DD`, strictly ascending, no duplicates. Prices must be exact
+in minor units: `123.456` is **rejected**, not rounded — a feed that quietly
+rounds sub-minor precision is telling you its data is in a different unit than
+you think. Rows with `high < low`, a close or open outside `[low, high]`, a
+non-positive price or a non-integer volume are rejected, and every rejection
+names the file and the line. The file is streamed, not slurped.
+
+Where those files come from is the operator's decision. `HttpFeed` can fetch them
+(GET only, allowlisted hosts), and ships one worked example adapter — but **no
+provider's terms of use have been read or verified by this code**. Confirm, in
+writing and for your own jurisdiction and use, that your provider permits
+automated retrieval before enabling it. An API key is not permission.
+
+**A holiday list.** `src/market/calendar.ts` knows only the regular trading week
+— US Mon–Fri, Tadawul Sun–Thu — and ships an **empty** holiday list for both
+venues, deliberately. Exchange holidays move (Eid dates are lunar) and a stale
+hardcoded list is worse than none because it is believed. Supply
+`ARES_MARKET_US_HOLIDAYS` / `ARES_MARKET_TADAWUL_HOLIDAYS` from the venue's own
+published calendar. With an empty list the calendar will count a closed holiday
+as a session; in replay that surfaces immediately as a missing bar, and the
+report prints `EMPTY LIST` next to the venue rather than hiding it.
+
+**A broker cost schedule.** Commission per side, its minimum, half-spread,
+slippage and settlement delay are all configuration
+(`ARES_MARKET_<VENUE>_*`). The shipped defaults are plausible retail figures
+chosen to be *pessimistic rather than flattering*; no tariff has been verified.
+Replace them before believing a P&L figure.
+
+**An FX rate.** `ARES_MARKET_FX_SAR_PER_USD` (default `3.75`). The SAR/USD peg is
+a central-bank policy, not a law of nature; it is labelled as a configured
+assumption in exactly the way the VAT rate is, and cross-currency P&L is only as
+good as that one number.
+
+### "10 working days" is two different windows
+
+Ten US sessions and ten Tadawul sessions are not the same calendar days — the US
+week ends Friday, the Saudi week ends Thursday. Sessions are counted **per
+venue**, T+2 settlement counts **sessions** rather than calendar days, and the
+report prints both windows side by side so nobody silently compares them.
+
+### What is deliberately not built
+
+No shorting, no margin, no leverage, no derivatives, no CFDs. A sell of more
+shares than are actually held throws `MARKET_NO_SHORTING`, and reserved shares
+mean two resting orders cannot together exceed a position. The reasons:
+
+- they are what turns a losing strategy into a *total* loss — without them the
+  worst case is the capital committed, with them it is unbounded;
+- margin interest raises **riba**, and CFDs raise **gharar**, concerns for a KSA
+  operator — a question for counsel, not for a trading loop;
+- none of them are needed to answer the only question worth asking, which is
+  whether a strategy beats doing nothing.
+
+Adding any of them later is a deliberate, separate, counsel-involved decision.
+
+### The benchmark is mandatory, and the sample is tiny
+
+Every run reports the swarm's realised P&L **beside buy-and-hold on the same
+instruments, over the same sessions, with the same capital and the same cost
+model**, plus max drawdown, trade count, total costs paid, win rate and the
+largest single loss. A strategy that underperforms buy-and-hold has no edge
+however much money it made, and `src/market/report.ts` says so in words at the
+top of the report rather than leaving it to be inferred.
+
+Ten sessions cannot separate skill from luck. The report therefore also prints
+the distribution of the same strategy's outcomes over every rolling historical
+window of the same length, and the fraction of those windows that reached +100%
+— the real base rate for that target. A single ten-session result is never
+presented as evidence of an edge, in either direction.
+
+### What could not be verified here
+
+The build environment blocks every market-data host (the agent proxy returns 403
+to `CONNECT` for `stooq.com`, `query1.finance.yahoo.com`, `saudiexchange.sa` and
+`api.twelvedata.com`; this was checked, not assumed). Consequently:
+
+- `CsvFeed` is fully exercised and is the implementation this environment runs.
+- `HttpFeed` is fully unit-tested through an **injected transport** — allowlist
+  refusal, scheme refusal, redirect refusal, redirect bounds, timeout, oversize,
+  bad status, parse failure, rate limiting and circuit behaviour are all proven
+  offline — but **no real HTTP response has ever been fetched or parsed here**.
+  The example provider adapter's URL shape and column layout are unverified
+  guesses until someone runs them against the live host.
+- No price in this repository is a real observed price. Nothing in the test suite
+  establishes that any strategy would have made money.
 
 ---
 

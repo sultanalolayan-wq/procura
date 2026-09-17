@@ -119,6 +119,27 @@ class StubExecutor implements EquityExecutor {
     this.submitted.push(order);
     this.queue.push(order);
   }
+  /** Liquidation at this session's CLOSE, exit costs charged, settling here. */
+  async closeOut(req: { symbol: string; venue: Venue; qty: number; dayUtc: string; idempotencyKey: string }): Promise<EquityFill> {
+    const bars = await this.feed.bars(req.symbol, req.venue, req.dayUtc, req.dayUtc);
+    const bar = bars[0];
+    if (bar === undefined) throw new Error(`no bar for ${req.symbol} on ${req.dayUtc}`);
+    const gross = bar.closeMinor * req.qty;
+    return {
+      orderId: `closeout:${req.symbol}:${req.dayUtc}`,
+      symbol: req.symbol,
+      venue: req.venue,
+      side: 'SELL',
+      qty: req.qty,
+      fillDayUtc: req.dayUtc,
+      unitPriceMinor: bar.closeMinor,
+      grossMinor: gross,
+      costsMinor: Math.ceil((gross * this.costBps) / 10_000),
+      settlesDayUtc: req.dayUtc,
+      currency: 'SAR',
+    };
+  }
+
   async fills(venue: Venue, dayUtc: string): Promise<EquityFill[]> {
     const ready = this.queue.filter((o) => o.venue === venue && o.decidedDayUtc < dayUtc);
     this.queue = this.queue.filter((o) => !(o.venue === venue && o.decidedDayUtc < dayUtc));
@@ -200,10 +221,21 @@ async function rig(
   };
 }
 
-async function runSessions(r: Rig, upto = r.days.length, venue: Venue = 'US'): Promise<void> {
+/**
+ * `closeOutAtEnd` marks the last session as the run's final one, which is what
+ * makes the agent liquidate at the close. A test that wants to observe a LIVE,
+ * still-open position mid-run sets it false — otherwise the position it is
+ * inspecting has already been marked out.
+ */
+async function runSessions(r: Rig, upto = r.days.length, opts: { venue?: Venue; closeOutAtEnd?: boolean } = {}): Promise<void> {
+  const venue = opts.venue ?? 'US';
+  const closeOut = opts.closeOutAtEnd ?? true;
   for (let i = 0; i < upto; i++) {
-    r.agent.setSession({ venue, dayUtc: r.days[i] as string, tick: i, finalSession: i === upto - 1 });
+    r.agent.setSession({ venue, dayUtc: r.days[i] as string, tick: i, finalSession: closeOut && i === upto - 1 });
     await r.agent.runTick(i);
+    // The supervisor drains the bus between ticks; these tests do the same, so
+    // what the observer sees is what a real run would have delivered.
+    await r.stack.bus.drain();
   }
 }
 
@@ -433,8 +465,9 @@ describe('trader: the bandit is rewarded on realised P&L at settlement', () => {
   it('records NO outcome while the position is merely marked up', async () => {
     const r = await rig(RISE_THEN_CRASH, { arms: ['buy-and-hold'] });
     try {
-      // Sessions 0..3: enter, fill, and the mark runs from 100 to 150.
-      await runSessions(r, 4);
+      // Sessions 0..3: enter, fill, and the mark runs from 100 to 150. The run
+      // is NOT ended here, so the position is still open and still unrealised.
+      await runSessions(r, 4, { closeOutAtEnd: false });
       assert.equal(r.outcomes().length, 0, 'an unrealised gain is not an outcome');
       assert.equal(r.agent.traderStats().roundTripsClosed, 0);
       assert.ok(r.agent.openPositions().length === 1);
@@ -461,13 +494,38 @@ describe('trader: the bandit is rewarded on realised P&L at settlement', () => {
       const w = r.agent.learner.weights()['buy-and-hold'];
       assert.ok(w !== undefined && w.b > 1, 'a losing round trip must increment the failure count');
       assert.equal(w.a, 1);
-      // Settlement is T+2: the sale is booked on the settlement session, not the
-      // session it filled on.
+      // The exit here is the final-session close-out: marked out at that
+      // session's close with the exit costs charged, which is the same
+      // convention market/report.ts closes the benchmark with.
       const sales = r.stack.ledger.entries({ type: 'SALE' });
       assert.equal(sales.length, 1);
+      assert.equal(sales[0]?.meta['paper'], true);
+      assert.ok((o.meta['costsMinor'] as number) > 0, 'the exit is not free');
+    } finally {
+      r.stack.close();
+    }
+  });
+
+  it('settles T+2: a signal-driven exit is booked on the SETTLEMENT session', async () => {
+    // 20 flat sessions of warmup, a breakout that enters, then a collapse below
+    // the 10-session low that exits — mid-run, so the T+2 delay is observable.
+    const closes = [
+      ...new Array(20).fill(100_00),
+      101_00, 101_00, 101_00,
+      50_00, 50_00, 50_00, 50_00, 50_00,
+    ] as number[];
+    const r = await rig(closes, { arms: ['momentum'] });
+    try {
+      await runSessions(r, closes.length, { closeOutAtEnd: false });
+      const sales = r.stack.ledger.entries({ type: 'SALE' });
+      assert.equal(sales.length, 1, 'the momentum exit should have fired and settled');
       const sale = sales[0];
       assert.notEqual(sale?.meta['soldDayUtc'], sale?.meta['settlementDayUtc']);
-      assert.equal(sale?.meta['paper'], true);
+      assert.ok(String(sale?.meta['settlementDayUtc']) > String(sale?.meta['soldDayUtc']));
+      // And nothing was learned from it before the cash landed.
+      const outs = r.outcomes();
+      assert.equal(outs.length, 1);
+      assert.equal((outs[0]?.payload as { meta: Record<string, unknown> }).meta['settledDayUtc'], sale?.meta['settlementDayUtc']);
     } finally {
       r.stack.close();
     }
@@ -539,7 +597,7 @@ describe('trader: state survives a restart', () => {
     const closes = [100_00, 100_00, 100_00, 100_00, 100_00, 100_00];
     const r = await rig(closes, { arms: ['buy-and-hold'] });
     try {
-      await runSessions(r, 3);
+      await runSessions(r, 3, { closeOutAtEnd: false });
       const before = r.agent.openPositions();
       assert.equal(before.length, 1);
       assert.ok((before[0] as { qty: number }).qty > 0);
@@ -567,7 +625,7 @@ describe('trader: state survives a restart', () => {
   it('hands over open positions and unsettled cash when it dies', async () => {
     const r = await rig([100_00, 100_00, 100_00, 100_00], { arms: ['buy-and-hold'] });
     try {
-      await runSessions(r, 3);
+      await runSessions(r, 3, { closeOutAtEnd: false });
       const state = r.agent.handoverState();
       assert.ok(Array.isArray(state['openPositions']));
       assert.ok(Array.isArray(state['pendingSettlements']));
@@ -584,7 +642,7 @@ describe('trader: the safety machinery is still wired', () => {
     const r = await rig([100_00, 100_00, 100_00, 100_00], { arms: ['buy-and-hold'] });
     try {
       r.stack.killSwitch.trip('operator halt');
-      await runSessions(r, 3);
+      await runSessions(r, 3, { closeOutAtEnd: false });
       assert.equal(r.exec.submitted.length, 0, 'a halted swarm places no orders');
     } finally {
       r.stack.close();
@@ -609,6 +667,7 @@ describe('trader: the safety machinery is still wired', () => {
       for (let i = 0; i < 3; i++) {
         agent.setSession({ venue: 'US', dayUtc: days[i] as string, tick: i });
         await agent.runTick(i);
+        await stack.bus.drain();
       }
       assert.equal(exec.submitted.length, 0);
       assert.ok(stack.of('POLICY_DENIED').length > 0);
@@ -622,7 +681,7 @@ describe('trader: the safety machinery is still wired', () => {
     try {
       const make = traderFactory({ feed: r.feed, executor: r.exec, universe: r.universe, arms: ['buy-and-hold'] });
       const id = newTraderId();
-      assert.match(id, /^trader-/);
+      assert.match(id, /^trader_/);
       const a = make(id, 'equities-paper', r.stack.depsFor(id));
       assert.equal(a.role, 'trader');
       assert.equal(instrumentKey({ symbol: 'ACME', venue: 'US' }), 'US:ACME');

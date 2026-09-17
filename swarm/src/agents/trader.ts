@@ -64,39 +64,16 @@ import { money, type Currency, type Minor } from '../core/money.js';
 import type { AgentId, Offer, Opportunity } from '../core/types.js';
 import { Bandit } from '../memory/learning.js';
 import type { ChannelAdapter } from '../channels/adapter.js';
+import type { Bar, PriceFeed, Venue } from '../market/feed.js';
 import { BaseAgent, type AgentDeps } from './base.js';
 
 /* ────────────────────────────────────────────────────────────────────────────
- * MARKET_SPEC §2 — the FROZEN feed seam.
- *
- * These declarations mirror src/market/feed.ts exactly. They are declared here
- * rather than imported so that this agent, its tests and the run controller
- * compile and run without src/market/ being finished. TypeScript is structural:
- * the sibling's `Bar`/`PriceFeed`/`Venue` are assignable to these and vice
- * versa, so nothing has to change when that module lands.
+ * MARKET_SPEC §2 — the FROZEN feed seam, imported from the module that owns it.
+ * Re-exported here so a caller wiring a trader does not need two imports, and
+ * so there is exactly ONE definition of Bar/PriceFeed/Venue in the codebase.
  * ──────────────────────────────────────────────────────────────────────────── */
 
-export type Venue = 'US' | 'TADAWUL';
-
-export interface Bar {
-  symbol: string;
-  venue: Venue;
-  /** YYYY-MM-DD */
-  dayUtc: string;
-  openMinor: Minor;
-  highMinor: Minor;
-  lowMinor: Minor;
-  closeMinor: Minor;
-  volume: number;
-  currency: Currency;
-}
-
-export interface PriceFeed {
-  readonly name: string;
-  bars(symbol: string, venue: Venue, fromDay: string, toDay: string): Promise<Bar[]>;
-  latest(symbol: string, venue: Venue): Promise<Bar | null>;
-  close(): Promise<void>;
-}
+export type { Bar, PriceFeed, Venue } from '../market/feed.js';
 
 /* ──────────────────────────────────────────────────────────── the strategies */
 
@@ -439,6 +416,39 @@ export function makeSizingPolicy(p: Partial<SizingPolicy> = {}): SizingPolicy {
   return Object.freeze(out);
 }
 
+/**
+ * CONFIG-DRIVEN SIZING. The caps are environment variables, not constants, so
+ * the operator sets them without editing code — but every value still goes
+ * through makeSizingPolicy(), so no environment variable can buy leverage:
+ * ARES_TRADER_MAX_EXPOSURE_BPS=50000 is refused at boot, loudly.
+ *
+ * ARES_TRADER_MAX_POSITION_BPS   per-position cap, bps of equity   (default 2500)
+ * ARES_TRADER_MAX_EXPOSURE_BPS   total exposure cap, bps of equity (default 8000)
+ * ARES_TRADER_RISK_BPS           equity risked per trade, bps      (default 100)
+ * ARES_TRADER_STOP_BPS           adverse move sized against, bps   (default 800)
+ * ARES_TRADER_MIN_POSITION_MINOR smallest worthwhile position      (default 1)
+ *
+ * It lives here rather than in core/config.ts because the market block in that
+ * file is owned by the market module; these five numbers belong to the agent.
+ */
+export function sizingFromEnv(env: Record<string, string | undefined> = process.env): SizingPolicy {
+  const num = (key: string, def: number): number => {
+    const raw = env[key];
+    if (raw === undefined || raw.trim() === '') return def;
+    if (!/^\d+$/.test(raw.trim())) {
+      throw new AresError('SIZING_INVALID', `sizingFromEnv: ${key} must be a non-negative integer, got ${JSON.stringify(raw)}`, { key, raw });
+    }
+    return Number(raw.trim());
+  };
+  return makeSizingPolicy({
+    maxPositionFractionBps: num('ARES_TRADER_MAX_POSITION_BPS', DEFAULT_SIZING.maxPositionFractionBps),
+    maxTotalExposureBps: num('ARES_TRADER_MAX_EXPOSURE_BPS', DEFAULT_SIZING.maxTotalExposureBps),
+    riskPerTradeBps: num('ARES_TRADER_RISK_BPS', DEFAULT_SIZING.riskPerTradeBps),
+    stopLossBps: num('ARES_TRADER_STOP_BPS', DEFAULT_SIZING.stopLossBps),
+    minPositionMinor: num('ARES_TRADER_MIN_POSITION_MINOR', DEFAULT_SIZING.minPositionMinor),
+  });
+}
+
 export type SizeBinding = 'risk' | 'position-cap' | 'exposure-cap' | 'cash' | 'per-trade-cap' | 'min-size' | 'price';
 
 export interface SizeRequest {
@@ -621,6 +631,23 @@ export interface EquityFill {
  * socket, no rate and no cost model of its own — modelling the fill against the
  * real bar is the channel's job, and there is no path from here to a network.
  */
+/**
+ * WIRING THIS TO src/channels/equities.ts. EquitiesChannel is a ChannelAdapter
+ * and already models the fill, the costs, the settlement delay and the FX; it is
+ * addressed by a PER-VENUE tick (its `sessionDay(tick)` counts that venue's own
+ * sessions, which is why ten US ticks and ten Tadawul ticks are different
+ * calendar windows). A wrapper therefore has to do three things and no more:
+ *   1. keep a per-venue session counter, so `decidedDayUtc` maps to that
+ *      venue's tick — the run controller's step index is GLOBAL and is not it;
+ *   2. route BUY through `channel.buy(opportunity, qty, tick, idem)`, which
+ *      returns a holding already priced at `executionDay(tick)`'s open, and
+ *      hand that back from `fills()` on the NEXT session so this agent's
+ *      day accounting stays honest; route SELL through `publish()` + `poll()`;
+ *   3. convert the venue's currency to the swarm's base with `channel.toBase()`
+ *      before it reaches this interface — everything below is base currency.
+ * The wrapper is deliberately NOT in this file: this agent must be testable
+ * against a stub, and the channel must be replaceable without touching it.
+ */
 export interface EquityExecutor {
   readonly name: string;
   /**
@@ -632,6 +659,16 @@ export interface EquityExecutor {
   submit(order: EquityOrderRequest): Promise<void>;
   /** Fills that occurred at this session's open. Each is returned exactly once. */
   fills(venue: Venue, dayUtc: string): Promise<EquityFill[]>;
+  /**
+   * FINAL-SESSION LIQUIDATION, at THIS session's CLOSE, with the full exit cost
+   * charged. Inside a fixed window there is no "next open" to sell into, so the
+   * alternative to this is either leaving the run's result as an open position
+   * and a story, or marking out without paying the exit — and marking out for
+   * free is exactly how a backtest flatters itself. This is the same convention
+   * market/report.ts uses to close the buy-and-hold benchmark, so the swarm and
+   * the benchmark are closed the same way and remain comparable.
+   */
+  closeOut(req: { symbol: string; venue: Venue; qty: number; dayUtc: string; idempotencyKey: string }): Promise<EquityFill>;
 }
 
 /* ─────────────────────────────────────────────────────────── agent internals */
@@ -646,6 +683,8 @@ export interface OpenPosition {
   qty: number;
   /** All-in cost basis: cash out including every cost, in minor units. */
   basisMinor: Minor;
+  /** The entry side's explicit costs, carried so the report can split them out. */
+  entryCostsMinor: Minor;
   entryDayUtc: string;
   entryTick: number;
   roundTripId: string;
@@ -666,6 +705,9 @@ export interface PendingSettlement {
   costsMinor: Minor;
   /** Basis relieved by this sale. */
   basisMinor: Minor;
+  /** The entry costs inside that basis, prorated. Reported, not re-charged. */
+  entryCostsMinor: Minor;
+  entryDayUtc: string;
   soldDayUtc: string;
   settlesDayUtc: string;
   /** Mark-to-market P&L at the moment of sale. REPORTED, never rewarded. */
@@ -685,10 +727,14 @@ export interface ClosedRoundTrip {
   venue: Venue;
   qty: number;
   basisMinor: Minor;
+  /** Explicit costs of the ENTRY side, already inside basisMinor. */
+  entryCostsMinor: Minor;
   proceedsMinor: Minor;
+  /** Explicit costs of the EXIT side, already deducted from proceedsMinor. */
   costsMinor: Minor;
   realisedMinor: Minor;
   markAtSaleMinor: Minor;
+  entryDayUtc: string;
   soldDayUtc: string;
   settledDayUtc: string;
   settlementTick: number;
@@ -983,6 +1029,7 @@ export class TraderAgent extends BaseAgent {
     }
     pos.qty += qty;
     pos.basisMinor += spentMinor;
+    pos.entryCostsMinor += Math.max(0, f.costsMinor);
     this.stats.buysFilled++;
     this.stats.costsPaidMinor += Math.max(0, f.costsMinor);
     this.marks.set(key, f.unitPriceMinor);
@@ -1017,6 +1064,7 @@ export class TraderAgent extends BaseAgent {
     if (qty <= 0) return;
     const proceedsMinor = f.grossMinor - Math.max(0, f.costsMinor);
     const basisRelieved = pos.qty === qty ? pos.basisMinor : Math.floor((pos.basisMinor * qty) / pos.qty);
+    const entryCostsRelieved = pos.qty === qty ? pos.entryCostsMinor : Math.floor((pos.entryCostsMinor * qty) / pos.qty);
     const markAtSale = qty * (this.marks.get(key) ?? f.unitPriceMinor) - basisRelieved;
 
     this.pending.push({
@@ -1029,12 +1077,15 @@ export class TraderAgent extends BaseAgent {
       proceedsMinor,
       costsMinor: Math.max(0, f.costsMinor),
       basisMinor: basisRelieved,
+      entryCostsMinor: entryCostsRelieved,
+      entryDayUtc: pos.entryDayUtc,
       soldDayUtc: f.fillDayUtc,
       settlesDayUtc: f.settlesDayUtc,
       markAtSaleMinor: markAtSale,
     });
     pos.qty -= qty;
     pos.basisMinor -= basisRelieved;
+    pos.entryCostsMinor -= entryCostsRelieved;
     if (pos.qty <= 0) this.positions.delete(key);
     this.stats.sellsFilled++;
     this.stats.costsPaidMinor += Math.max(0, f.costsMinor);
@@ -1102,10 +1153,12 @@ export class TraderAgent extends BaseAgent {
         venue: p.venue,
         qty: p.qty,
         basisMinor: p.basisMinor,
+        entryCostsMinor: p.entryCostsMinor,
         proceedsMinor: p.proceedsMinor,
         costsMinor: p.costsMinor,
         realisedMinor,
         markAtSaleMinor: p.markAtSaleMinor,
+        entryDayUtc: p.entryDayUtc,
         soldDayUtc: p.soldDayUtc,
         settledDayUtc: p.settlesDayUtc,
         settlementTick: s.tick,
@@ -1303,6 +1356,7 @@ export class TraderAgent extends BaseAgent {
         arm: sig.arm,
         qty: 0,
         basisMinor: 0,
+        entryCostsMinor: 0,
         entryDayUtc: s.dayUtc,
         entryTick: s.tick,
         roundTripId,
@@ -1351,6 +1405,22 @@ export class TraderAgent extends BaseAgent {
         return;
       }
       throw err;
+    }
+
+    if (why === 'final-session-close-out') {
+      // No next open exists inside the window: liquidate at this close, pay the
+      // exit costs, and settle it here — the run ends with a realised number.
+      const fill = await this.executor.closeOut({
+        symbol: inst.symbol,
+        venue: inst.venue,
+        qty: pos.qty,
+        dayUtc: s.dayUtc,
+        idempotencyKey: idempotencyKey(['trader.closeout', this.id, key, s.dayUtc]),
+      });
+      this.bookSellFill({ ...fill, settlesDayUtc: fill.settlesDayUtc <= s.dayUtc ? fill.settlesDayUtc : s.dayUtc }, s);
+      this.settleDue(s);
+      this.explain(s, inst, pos.arm, sig, { action: 'EXIT', note: `${why} (marked out at the close, exit costs charged)`, qty: fill.qty, roundTripId: pos.roundTripId });
+      return;
     }
 
     this.orderSeq++;
