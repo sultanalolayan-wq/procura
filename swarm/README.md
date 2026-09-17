@@ -501,7 +501,13 @@ range does not **must not** fill, while a limit that only D1's range contains
 ### What the operator supplies
 
 **Price files.** `CsvFeed` reads `<ARES_DATA_DIR>/market/<venue>/<symbol>.csv`
-(venue lower-cased: `us`, `tadawul`), header exactly:
+(venue directory lower-cased: `us`, `tadawul`). Symbols are configured upper-cased
+(`ARES_MARKET_US_SYMBOLS=AAPL`) but the **file name is matched case-insensitively**:
+`aapl.csv` is the canonical name and `AAPL.csv` loads too, because a file the
+operator can see in the directory that the feed calls missing is a defect blamed
+on the data. `CsvFeed.pathFor()` returns the canonical lower-case name;
+`CsvFeed.pathCandidatesFor()` is the full accepted list, in order, with no
+directory scan, so resolution is deterministic. Header exactly:
 
 ```
 date,open,high,low,close,volume
@@ -577,6 +583,31 @@ the distribution of the same strategy's outcomes over every rolling historical
 window of the same length, and the fraction of those windows that reached +100%
 — the real base rate for that target. A single ten-session result is never
 presented as evidence of an edge, in either direction.
+
+**A base rate is a number per position size.** Commission is floored at a venue
+minimum (`minCommissionMinor`, 1.00 by default), and a fixed cost is a percentage
+only relative to a size, so the distribution states the capital each window
+deploys and the report prints it beside every base rate:
+
+- `windowDistribution()` (buy-and-hold) sizes each window at `notionalMinor` in
+  the venue's own minor units — `floor(capital / entry price)` whole lots,
+  defaulting to `DEFAULT_WINDOW_NOTIONAL_MINOR` (100,000 minor = 1,000.00). A run
+  passes its own equal-weight per-instrument share of starting capital instead.
+  Windows whose entry price the capital cannot cover for one lot are **skipped and
+  counted** (`skippedWindows`), not scored as losses.
+- `armWindowedEvaluation()` (the traded arms) runs each window against a book of
+  `startingEquityMinor` and sizes every entry through the same `sizePosition` the
+  live agent uses.
+
+Both charge the full cost model on the **real** quantity: commission on both
+sides floored at the minimum, half-spread and slippage inside every fill. Both
+assert that no window returns below **-100%** — an unleveraged long cannot lose
+more than the capital deployed, so such a number is a broken computation, and
+`MARKET_REPORT_IMPOSSIBLE_RETURN` is thrown rather than quietly folded into a
+median. (This is not hypothetical: a one-share basis on NVDA's March 2000 move
+from 1.16 to 2.85 — the share up **+145.7%** — reported **-14.4%**, because a
+1.00 minimum commission on each side of a 1.16 position is the whole trade. The
+same window at a real size reports roughly +145%.)
 
 ### What could not be verified here
 

@@ -203,7 +203,9 @@ export async function parseCsvFile(path: string, opts: CsvParseOptions & { maxBy
       throw new AresError(
         'MARKET_CSV_MISSING',
         `${path}: no price file for this symbol. CsvFeed reads ` +
-          `<dataDir>/market/<venue>/<symbol>.csv — the operator supplies these files.`,
+          `<dataDir>/market/<venue>/<symbol>.csv — the operator supplies these files. The venue directory is ` +
+          `lower-case ("us", "tadawul"); the file name is matched case-insensitively, so AAPL.csv and aapl.csv ` +
+          `both load.`,
         { path, symbol: opts.symbol, venue: opts.venue },
       );
     }
@@ -253,7 +255,11 @@ export async function parseCsvFile(path: string, opts: CsvParseOptions & { maxBy
 }
 
 export interface CsvFeedOptions {
-  /** cfg.dataDir. Files live at <dataDir>/market/<venue>/<symbol>.csv. */
+  /**
+   * cfg.dataDir. Files live at <dataDir>/market/<venue>/<symbol>.csv, with the
+   * venue directory lower-cased and the file name matched case-insensitively
+   * (`aapl.csv`, `AAPL.csv` and the symbol as written all resolve).
+   */
   dataDir: string;
   logger?: Logger;
   maxBytes?: number;
@@ -280,10 +286,57 @@ export class CsvFeed implements PriceFeed {
     this.log = opts.logger ?? nullLogger;
   }
 
+  /**
+   * The CANONICAL path for a symbol: `<dataDir>/market/<venue lower>/<symbol lower>.csv`.
+   *
+   * Symbols are conventionally written upper-cased (`AAPL`, and that is how they
+   * are configured in ARES_MARKET_US_SYMBOLS), so an operator naturally saves
+   * `AAPL.csv`. This returns `aapl.csv`. The two must not be allowed to disagree
+   * silently — a file the operator can see in the directory, that the feed reports
+   * as missing, is the kind of defect that gets blamed on the data. So the
+   * canonical name is lower-case, and `resolvePath` ALSO accepts the symbol as
+   * written and upper-cased. See `pathCandidatesFor`.
+   */
   pathFor(symbol: string, venue: Venue): string {
     assertSymbol(symbol, 'CsvFeed.pathFor');
     assertVenue(venue, 'CsvFeed.pathFor');
     return join(this.opts.dataDir, 'market', venue.toLowerCase(), `${symbol.toLowerCase()}.csv`);
+  }
+
+  /**
+   * Every file name accepted for a symbol, most canonical first: lower-case, then
+   * the symbol exactly as written, then upper-case. A fixed, deduplicated list —
+   * no directory scan, so the answer does not depend on what else is in the folder
+   * and two runs over the same tree resolve identically.
+   */
+  pathCandidatesFor(symbol: string, venue: Venue): string[] {
+    assertSymbol(symbol, 'CsvFeed.pathCandidatesFor');
+    assertVenue(venue, 'CsvFeed.pathCandidatesFor');
+    const dir = join(this.opts.dataDir, 'market', venue.toLowerCase());
+    const names = [symbol.toLowerCase(), symbol, symbol.toUpperCase()];
+    const out: string[] = [];
+    for (const n of names) {
+      const path = join(dir, `${n}.csv`);
+      if (!out.includes(path)) out.push(path);
+    }
+    return out;
+  }
+
+  /**
+   * The first candidate that exists, or the canonical path when none does — so a
+   * genuinely missing file still fails with the name the operator should create.
+   */
+  async resolvePath(symbol: string, venue: Venue): Promise<string> {
+    const candidates = this.pathCandidatesFor(symbol, venue);
+    for (const candidate of candidates) {
+      try {
+        const st = await stat(candidate);
+        if (st.isFile()) return candidate;
+      } catch {
+        // Not this one. A missing candidate is the normal case, not an error.
+      }
+    }
+    return candidates[0] as string;
   }
 
   private assertOpen(op: string): void {
@@ -298,7 +351,7 @@ export class CsvFeed implements PriceFeed {
     const key = `${venue}:${symbol}`;
     const hit = this.cache.get(key);
     if (hit !== undefined) return hit;
-    const path = this.pathFor(symbol, venue);
+    const path = await this.resolvePath(symbol, venue);
     const parsed = await parseCsvFile(path, {
       symbol,
       venue,

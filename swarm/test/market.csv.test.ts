@@ -281,3 +281,54 @@ test('MemoryFeed enforces the same invariants as the file feed', async () => {
   );
   assert.equal(await f.latest('X', 'US'), null);
 });
+
+test('a ticker file saved as AAPL.csv loads: the file name is matched case-insensitively', async () => {
+  const dir = tmp();
+  try {
+    // The operator configures ARES_MARKET_US_SYMBOLS=AAPL and saves AAPL.csv.
+    // pathFor() canonicalises to aapl.csv, so without a case-insensitive lookup
+    // this file is invisible and the feed reports data that is plainly there as
+    // missing. Docs and code must agree; this pins which way they agree.
+    const d = join(dir, 'market', 'us');
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'AAPL.csv'), GOOD);
+
+    const feed = new CsvFeed({ dataDir: dir });
+    assert.equal(feed.pathFor('AAPL', 'US'), join(dir, 'market', 'us', 'aapl.csv'));
+    assert.deepEqual(feed.pathCandidatesFor('AAPL', 'US'), [
+      join(dir, 'market', 'us', 'aapl.csv'),
+      join(dir, 'market', 'us', 'AAPL.csv'),
+    ]);
+    assert.equal(await feed.resolvePath('AAPL', 'US'), join(d, 'AAPL.csv'));
+    const bars = await feed.bars('AAPL', 'US', '2025-01-01', '2025-01-31');
+    assert.equal(bars.length, 3);
+    assert.equal(bars[0]?.symbol, 'AAPL');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the lower-case name is canonical and wins when both exist, and a miss names it', async () => {
+  const dir = tmp();
+  try {
+    const d = join(dir, 'market', 'us');
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'aapl.csv'), GOOD);
+    writeFileSync(
+      join(d, 'AAPL.csv'),
+      [HEADER, '2025-01-02,1.00,1.00,1.00,1.00,1', ''].join('\n'),
+    );
+    const feed = new CsvFeed({ dataDir: dir });
+    const bars = await feed.bars('AAPL', 'US', '2025-01-01', '2025-01-31');
+    assert.equal(bars.length, 3, 'the canonical lower-case file is the one that loads');
+
+    // A genuinely absent file still fails, naming the canonical path to create
+    // and saying that the name is matched case-insensitively.
+    const miss = await failure(() => new CsvFeed({ dataDir: dir }).bars('MSFT', 'US', '2025-01-01', '2025-01-31'));
+    assert.equal(miss.code, 'MARKET_CSV_MISSING');
+    assert.match(miss.message, /msft\.csv/);
+    assert.match(miss.message, /case-insensitively/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

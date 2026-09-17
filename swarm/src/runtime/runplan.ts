@@ -40,7 +40,7 @@ import { join } from 'node:path';
 import { AresError } from '../core/errors.js';
 import type { AresConfig } from '../core/config.js';
 import type { Logger } from '../core/logger.js';
-import { money, type Minor, type Money } from '../core/money.js';
+import { fmt, money, type Currency, type Minor, type Money } from '../core/money.js';
 import type { MemoryStore } from '../memory/store.js';
 import {
   DEFAULT_STRATEGY_PARAMS,
@@ -56,16 +56,18 @@ import {
   type StrategyParams,
   type TraderAgent,
 } from '../agents/trader.js';
-import type { Bar, PriceFeed, Venue } from '../market/feed.js';
+import { VENUE_CURRENCY, type Bar, type PriceFeed, type Venue } from '../market/feed.js';
 import type { SessionCalendar } from '../market/calendar.js';
 import {
   DEFAULT_COSTS,
   commissionMinor,
   modelFill,
+  toCurrency,
   type EquityTrade,
   type VenueCostModel,
 } from '../channels/equities.js';
 import {
+  assertUnleveragedReturnBps,
   buildRunReport,
   computeBuyAndHold,
   computeSwarmMetrics,
@@ -320,6 +322,16 @@ function percentileOf(sorted: readonly number[], q: number): number {
  * report.ts::windowDistribution answers this for buy-and-hold. This answers it
  * for whichever arm the swarm was actually trading, which is the number the
  * operator needs when the swarm was not buying and holding.
+ *
+ * SIZE BASIS. Unlike the old buy-and-hold distribution, this function never had a
+ * one-share basis to fix: every window runs simulateStrategy against a real book
+ * of `startingEquityMinor` and sizes each entry through the SAME sizePosition the
+ * live agent uses, so the minimum commission is already a percentage of a real
+ * position rather than the whole result. The return is (ending equity - starting
+ * equity) / starting equity, which is bounded below by -100% by construction —
+ * cash never goes negative and a long position is never worth less than zero. The
+ * bound is asserted anyway: it is cheap, and an impossible number that is merely
+ * unlikely to appear is still a number nobody would catch.
  */
 export function armWindowedEvaluation(opts: ArmWindowedOptions): ArmWindowedResult {
   const n = Math.max(2, Math.trunc(opts.windowSessions));
@@ -330,17 +342,26 @@ export function armWindowedEvaluation(opts: ArmWindowedOptions): ArmWindowedResu
   const returnsBps: number[] = [];
   for (let start = warm; start + n <= bars.length; start += step) {
     const sessionDays = bars.slice(start, start + n).map((b) => b.dayUtc);
+    const sim = simulateStrategy({
+      arm: opts.arm,
+      bars,
+      sessionDays,
+      startingEquityMinor: opts.startingEquityMinor,
+      costs: opts.costs,
+      sizing: opts.sizing,
+      ...(opts.params !== undefined ? { params: opts.params } : {}),
+      ...(opts.perTradeCapMinor !== undefined ? { perTradeCapMinor: opts.perTradeCapMinor } : {}),
+    });
     returnsBps.push(
-      simulateStrategy({
+      assertUnleveragedReturnBps(sim.returnBps, {
         arm: opts.arm,
-        bars,
-        sessionDays,
-        startingEquityMinor: opts.startingEquityMinor,
-        costs: opts.costs,
-        sizing: opts.sizing,
-        ...(opts.params !== undefined ? { params: opts.params } : {}),
-        ...(opts.perTradeCapMinor !== undefined ? { perTradeCapMinor: opts.perTradeCapMinor } : {}),
-      }).returnBps,
+        symbol: sim.symbol,
+        windowSessions: n,
+        firstDay: sessionDays[0],
+        lastDay: sessionDays[sessionDays.length - 1],
+        notionalMinor: opts.startingEquityMinor,
+        endingEquityMinor: sim.endingEquityMinor,
+      }),
     );
   }
   const sorted = [...returnsBps].sort((a, b) => a - b);
@@ -368,6 +389,13 @@ export function armWindowedEvaluation(opts: ArmWindowedOptions): ArmWindowedResu
     windowSessions: n,
     windows,
     returnsBps,
+    notionalMinor: opts.startingEquityMinor,
+    skippedWindows: 0,
+    basis:
+      `book of ${fmt(money(opts.startingEquityMinor, VENUE_CURRENCY[first?.venue ?? 'US'] as Currency))} per window, each entry ` +
+      `sized by the live sizing policy (risk, position, exposure, cash and per-trade caps), lot size ` +
+      `${Math.max(1, Math.trunc(opts.costs.lotSize))}, commission charged both sides on the real quantity and ` +
+      `floored at the venue minimum, half-spread and slippage inside every fill`,
     minBps: windows === 0 ? 0 : (sorted[0] as number),
     p10Bps: percentileOf(sorted, 0.1),
     medianBps: percentileOf(sorted, 0.5),
@@ -698,12 +726,30 @@ export class RunPlan {
     if (windowCfg !== null) {
       const n = windowCfg.windowSessions ?? this.o.sessionsPerVenue;
       const target = windowCfg.targetBps ?? 10_000;
+      // The base rate is quoted PER POSITION SIZE, so the size it is quoted at is
+      // the one this run actually deploys: the equal-weight per-instrument share
+      // of starting capital, converted into the venue's own currency. Quoting it
+      // on one share instead would let the fixed minimum commission swamp any
+      // low-priced instrument and report a double as a loss.
+      const perInstrumentBase = Math.max(
+        1,
+        Math.floor(this.o.startingCapitalMinor / Math.max(1, this.o.universe.length)),
+      );
       for (const inst of this.o.universe) {
+        const notionalMinor = Math.max(
+          1,
+          toCurrency(
+            money(perInstrumentBase, this.o.cfg.baseCurrency),
+            VENUE_CURRENCY[inst.venue],
+            this.sarPerUsd,
+          ).amount,
+        );
         // report.ts's own distribution: buy-and-hold, the benchmark's base rate.
         distributions.push(
           await windowDistribution(this.o.feed, inst, Math.max(2, n), {
             targetBps: target,
             costs: this.costsFor(inst.venue),
+            notionalMinor,
           }),
         );
         // And the same question asked of the arms the swarm actually traded.
@@ -812,6 +858,8 @@ export class RunPlan {
             `REACHED +${(a.targetBps / 100).toFixed(0)}%: ${(a.fractionAtTarget * 100).toFixed(2)}%`,
         );
       }
+      // A base rate without its position size is not a base rate.
+      L.push(`  SIZE BASIS: ${(result.armDistributions[0] as ArmWindowedResult).basis}.`);
     }
     L.push('');
     L.push(`SESSIONS EXECUTED: ${result.sessionsExecuted}${result.resumed ? ' (this run was RESUMED from persisted progress)' : ''}`);

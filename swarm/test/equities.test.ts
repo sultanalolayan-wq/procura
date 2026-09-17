@@ -44,6 +44,9 @@ import { SessionCalendar } from '../src/market/calendar.js';
 import { MemoryFeed } from '../src/market/csv.js';
 import { cmpDay, type Bar, type PriceFeed, type Venue } from '../src/market/feed.js';
 import {
+  DEFAULT_WINDOW_NOTIONAL_MINOR,
+  MIN_POSSIBLE_RETURN_BPS,
+  assertUnleveragedReturnBps,
   buildRunReport,
   computeBuyAndHold,
   computeSwarmMetrics,
@@ -807,3 +810,210 @@ test('a swarm that beats the benchmark is still not told it has an edge', async 
   assert.ok(report.honesty.some((h) => /uninterpretable/.test(h)), 'a report with no distribution must say so');
   assert.ok(report.assumptions.some((a) => /CONFIGURABLE ASSUMPTION/.test(a)));
 });
+
+/* ------------------------------ the sizing basis of the base rate (§10) ---- */
+
+/**
+ * A LOW-PRICED INSTRUMENT THAT DOUBLES — the reproduction, as a fixture.
+ *
+ * NVDA, March 2000 (split-adjusted): the window opens at 1.16 and closes ten
+ * sessions later at 2.85. The SHARE moved +145.7%. Those two endpoints are the
+ * verified numbers; the path between them is interpolated and never touched by
+ * the computation, which reads only the entry bar's OPEN and the exit bar's CLOSE.
+ *
+ * On a ONE-SHARE basis the USD 1.00 minimum commission is charged twice against a
+ * 1.16 position — 2.00 of cost on 1.16 of capital — and a 146% double is reported
+ * as a LOSS of about -14%. That is not a rounding error, it is the sign.
+ */
+function nvdaMarch2000(): { bars: Bar[]; sessions: string[] } {
+  const cal = new SessionCalendar();
+  const sessions = cal.sessionWindow('US', '2000-03-01', 10);
+  const closes = [1.1, 1.16, 1.35, 1.55, 1.75, 1.95, 2.15, 2.45, 2.65, 2.85];
+  const bars = sessions.map((d, i) => {
+    const px = closes[i] as number;
+    return bar(d, px, px * 1.05, px * 0.95, px, 'NVDA');
+  });
+  return { bars, sessions };
+}
+
+/** Same instrument, same size, falling to a penny: the other end of the range. */
+function collapsingPenny(): Bar[] {
+  const cal = new SessionCalendar();
+  const sessions = cal.sessionWindow('US', '2000-03-01', 10);
+  const closes = [1.2, 1.16, 0.8, 0.6, 0.4, 0.25, 0.15, 0.08, 0.03, 0.01];
+  return sessions.map((d, i) => {
+    const px = closes[i] as number;
+    return bar(d, px, px * 1.05, px * 0.95, px, 'PENNY');
+  });
+}
+
+test('a low-priced instrument that DOUBLES is reported as a double, not a loss', async () => {
+  const feed = new MemoryFeed(nvdaMarch2000().bars);
+  const inst = { symbol: 'NVDA', venue: 'US' as Venue };
+  const d = await windowDistribution(feed, inst, 10);
+
+  assert.equal(d.windows, 1, 'ten bars and a ten-session window is exactly one window');
+  assert.equal(d.notionalMinor, DEFAULT_WINDOW_NOTIONAL_MINOR);
+  const got = d.returnsBps[0] as number;
+
+  // The share moved 1.16 -> 2.85 = +145.7%. Sized properly, the round trip keeps
+  // almost all of that: spread, slippage and 10bps a side is the only drag.
+  const grossBps = Math.round(((285 - 116) * 10_000) / 116);
+  assert.ok(grossBps > 14_000 && grossBps < 14_700, `fixture check: gross ${grossBps}bps`);
+  assert.ok(got >= 10_000, `a 146% double must report at least +100%, got ${got}bps`);
+  assert.ok(got > 14_000, `costs must not eat a double: ${got}bps against a gross ${grossBps}bps`);
+  assert.ok(grossBps - got < 500, `cost drag of ${grossBps - got}bps on a sized position is too large`);
+  assert.equal(d.fractionAtTarget, 1, 'the +100% target was reached, so the base rate is 1');
+  assert.ok(d.basis.includes('1,000.00'), `the size must be stated with the number: ${d.basis}`);
+
+  // THE DEFECT, PINNED. Sized at one share — what this function used to do
+  // unconditionally — the same doubling reports a LOSS.
+  const oneShare = await windowDistribution(feed, inst, 10, { notionalMinor: 117 });
+  const broken = oneShare.returnsBps[0] as number;
+  assert.ok(broken < 0, `one share must be the losing basis, got ${broken}bps`);
+  assert.ok(
+    got - broken > 15_000,
+    `the sizing basis is the whole difference between a double and a loss: ${broken}bps vs ${got}bps`,
+  );
+});
+
+test('no window in any distribution may return below -100%', async () => {
+  const cases: Array<{ bars: Bar[]; symbol: string }> = [
+    { bars: trending().bars, symbol: 'AAPL' },
+    { bars: nvdaMarch2000().bars, symbol: 'NVDA' },
+    { bars: collapsingPenny(), symbol: 'PENNY' },
+  ];
+  for (const c of cases) {
+    const feed = new MemoryFeed(c.bars);
+    const d = await windowDistribution(feed, { symbol: c.symbol, venue: 'US' }, 10);
+    assert.ok(d.windows > 0, `${c.symbol}: no windows`);
+    assert.ok(d.minBps >= MIN_POSSIBLE_RETURN_BPS, `${c.symbol}: minBps ${d.minBps} is below -100%`);
+    for (const r of d.returnsBps) {
+      assert.ok(r >= MIN_POSSIBLE_RETURN_BPS, `${c.symbol}: a window returned ${r}bps, which cannot happen`);
+    }
+  }
+
+  // The guard is not decorative: the measured impossible values are rejected.
+  for (const impossible of [-10_001, -11_390, -11_613, Number.NaN]) {
+    assert.throws(
+      () => assertUnleveragedReturnBps(impossible, { where: 'test' }),
+      (err: unknown) => err instanceof AresError && err.code === 'MARKET_REPORT_IMPOSSIBLE_RETURN',
+      `${impossible}bps must be refused`,
+    );
+  }
+  assert.equal(assertUnleveragedReturnBps(MIN_POSSIBLE_RETURN_BPS, {}), MIN_POSSIBLE_RETURN_BPS);
+
+  // And a distribution that WOULD contain one fails loudly instead of emitting it:
+  // a penny stock bought one share at a time pays more commission than the exit
+  // is worth, which is arithmetically below a total loss.
+  const penny = new MemoryFeed(collapsingPenny());
+  const err = await failureOf(() =>
+    windowDistribution(penny, { symbol: 'PENNY', venue: 'US' }, 10, { notionalMinor: 117 }),
+  );
+  assert.equal(err.code, 'MARKET_REPORT_IMPOSSIBLE_RETURN');
+  assert.match(err.message, /unleveraged long cannot lose more than the capital deployed/);
+});
+
+test('the minimum commission shrinks as a share of the round trip as notional rises', async () => {
+  const feed = new MemoryFeed(nvdaMarch2000().bars);
+  const inst = { symbol: 'NVDA', venue: 'US' as Venue };
+  const costs = DEFAULT_COSTS.US;
+  const entryPrice = modelFill('BUY', nvdaMarch2000().bars[1] as Bar, null, costs).priceMinor;
+
+  // Sizes at which the USD 1.00 minimum is still what the trader is paying.
+  const notionals = [117, 1_000, 10_000, 100_000];
+  const shares: number[] = [];
+  const returns: number[] = [];
+  for (const n of notionals) {
+    const qty = Math.floor(n / entryPrice);
+    assert.ok(qty >= 1, `fixture check: notional ${n} must buy at least one share`);
+    const gross = entryPrice * qty;
+    // Both sides of the round trip, as a fraction of the position actually held.
+    shares.push((2 * commissionMinor(gross, costs)) / gross);
+    returns.push((await windowDistribution(feed, inst, 10, { notionalMinor: n })).returnsBps[0] as number);
+  }
+
+  for (let i = 1; i < shares.length; i++) {
+    assert.ok(
+      (shares[i] as number) < (shares[i - 1] as number),
+      `commission share must fall with size: ${String(shares[i - 1])} -> ${String(shares[i])}`,
+    );
+    assert.ok(
+      (returns[i] as number) > (returns[i - 1] as number),
+      `the reported return must improve with size: ${String(returns[i - 1])} -> ${String(returns[i])}`,
+    );
+  }
+  // At one share the minimum commission is 171% of the position; at 1,000.00 it
+  // has become the 10bps rate and nothing else.
+  assert.ok((shares[0] as number) > 1.5, `one share must be dominated by the minimum: ${String(shares[0])}`);
+  assert.ok(
+    (shares[shares.length - 1] as number) < 0.003,
+    `at size, commission is the rate: ${String(shares[shares.length - 1])}`,
+  );
+
+  // AND THE POINT: once the minimum stops binding, size stops mattering. Ten
+  // times the capital returns the same percentage, because a proportional cost is
+  // proportional. Everything the sizing basis fixed, it fixed by getting the FIXED
+  // cost out of the percentage — which is why a one-share basis was not merely
+  // conservative but wrong.
+  const big = await windowDistribution(feed, inst, 10, { notionalMinor: 1_000_000 });
+  assert.equal(big.returnsBps[0] as number, returns[returns.length - 1] as number);
+  const grossBps = Math.round(((285 - 116) * 10_000) / 116);
+  assert.ok(
+    grossBps - (big.returnsBps[0] as number) < 400,
+    `at size the window return must converge on the share's own move: ${String(big.returnsBps[0])} vs ${grossBps}`,
+  );
+  assert.ok((returns[0] as number) < 0, 'and the one-share basis still reports the double as a loss');
+});
+
+test('a window the capital could not have bought is skipped and counted, not scored', async () => {
+  const feed = new MemoryFeed(nvdaMarch2000().bars);
+  const inst = { symbol: 'NVDA', venue: 'US' as Venue };
+  // 1.00 of capital cannot buy a 1.16 share. That is not a 100% loss, it is a
+  // trade that never happened, and counting it as an outcome would be a lie.
+  const d = await windowDistribution(feed, inst, 10, { notionalMinor: 100 });
+  assert.equal(d.windows, 0);
+  assert.equal(d.skippedWindows, 1);
+  assert.equal(d.fractionAtTarget, 0);
+  assert.match(d.basis, /1 window\(s\) skipped/);
+
+  const report = buildRunReport({
+    runId: 'skipped',
+    startedAt: 0,
+    finishedAt: 1,
+    startingCapital: money(500_000, 'SAR'),
+    sarPerUsd: 3.75,
+    swarm: computeSwarmMetrics({ trades: [], startingCapital: money(500_000, 'SAR'), sarPerUsd: 3.75 }),
+    benchmark: await computeBuyAndHold({
+      feed,
+      instruments: [inst],
+      sessionsByVenue: { US: nvdaMarch2000().sessions },
+      startingCapital: money(500_000, 'SAR'),
+      sarPerUsd: 3.75,
+    }),
+    venues: [summariseVenue(new SessionCalendar(), 'US', nvdaMarch2000().sessions)],
+    distributions: [d],
+    instruments: [inst],
+    costs: { US: DEFAULT_COSTS.US },
+  });
+  // The rendered text hard-wraps, so the wording is asserted on the honesty lines
+  // it is built from, and the rendered form is only checked for its presence.
+  const honesty = report.honesty.join(' ');
+  assert.match(honesty, /NO 10-session window could be evaluated \(1 skipped\)/);
+  assert.match(honesty, /position size USD 1\.00 per window/, 'the size a base rate is quoted at must be stated');
+  assert.match(honesty, /1 window\(s\) skipped/);
+  const text = renderReport(report);
+  assert.match(text, /SIZE BASIS/, 'the report must print the size a base rate is quoted at');
+  assert.match(text, /could not be\s+evaluated|could not be evaluated|NO 10-session window/);
+});
+
+/** assert.rejects with the AresError in hand, for code and message assertions. */
+async function failureOf(fn: () => Promise<unknown>): Promise<AresError> {
+  try {
+    await fn();
+  } catch (err) {
+    assert.ok(err instanceof AresError, `expected AresError, got ${String(err)}`);
+    return err;
+  }
+  throw new Error('expected a throw, got none');
+}

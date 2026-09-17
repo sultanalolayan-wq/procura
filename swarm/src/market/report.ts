@@ -13,6 +13,13 @@
  * windows and states what fraction of those windows reached the operator's target,
  * so a single flattering fortnight is seen next to its own base rate.
  *
+ * A BASE RATE IS A NUMBER PER POSITION SIZE. Commission is floored at a venue
+ * minimum, and a fixed cost is only a percentage relative to a size, so every
+ * distribution here states the capital each window deploys (`notionalMinor`) and
+ * the report prints that basis beside the base rate. It is also asserted that no
+ * window returns below -100%: an unleveraged long cannot lose more than the cash
+ * put into it, so such a number is a defect, not an outcome, and it throws.
+ *
  * Integer minor units throughout. Callers: the run controller and the dashboard.
  */
 
@@ -325,6 +332,18 @@ export interface WindowDistribution {
   windowSessions: number;
   windows: number;
   returnsBps: number[];
+  /**
+   * The capital assumed deployed in EACH window, in the venue's own minor units.
+   * A base rate is meaningless without it: the same history quoted on a one-share
+   * position and on a real position size gives different answers, because the
+   * minimum commission is a fixed cost and a fixed cost is a percentage only
+   * relative to a size.
+   */
+  notionalMinor: Minor;
+  /** Windows dropped because the notional did not buy one whole lot at the entry price. */
+  skippedWindows: number;
+  /** The sizing basis in words, carried with the numbers so it cannot be quoted without it. */
+  basis: string;
   minBps: number;
   p10Bps: number;
   medianBps: number;
@@ -338,23 +357,105 @@ export interface WindowDistribution {
 }
 
 /**
+ * The capital ONE WINDOW is assumed to deploy, in the venue's own minor units,
+ * when the caller names no size. 100,000 minor units = 1,000.00 of the venue's
+ * currency: a position an individual operator could plausibly take, and large
+ * enough that the minimum commission (1.00 by default, both sides) is ~0.2% of
+ * the round trip rather than the whole result.
+ *
+ * WHY THIS NUMBER EXISTS AT ALL. This function used to buy ONE SHARE per window.
+ * On a low-priced instrument the fixed minimum commission then dwarfed the trade
+ * and inverted the answer: NVDA in March 2000 went 1.16 -> 2.85, a +145.7% move
+ * in the SHARE, and a one-share round trip reported -14.4% because it paid 1.00
+ * to buy and 1.00 to sell a 1.16 position. Worse, it could report returns below
+ * -100%, which an unleveraged long cannot produce, and that impossibility is the
+ * tell. The base rate for "+100% in ten sessions" is precisely the question this
+ * function answers, and the population where a double is most likely is exactly
+ * the low-priced population the old basis mangled.
+ *
+ * The number is a DEFAULT, not a fact about the operator. Pass notionalMinor.
+ */
+export const DEFAULT_WINDOW_NOTIONAL_MINOR = 100_000;
+
+/** An unleveraged long is bounded below by total loss: -10,000 bps. */
+export const MIN_POSSIBLE_RETURN_BPS = -10_000;
+
+/**
+ * An unleveraged long position cannot lose more than the cash put into it. A
+ * return below -100% is therefore not a bad outcome, it is a BROKEN COMPUTATION,
+ * and a distribution that quietly contains one is worse than one that refuses to
+ * exist: every percentile, the mean and the base rate are all downstream of it.
+ * So it throws, loudly, naming the window that produced it.
+ */
+export function assertUnleveragedReturnBps(returnBps: number, ctx: Record<string, unknown>): number {
+  if (!Number.isFinite(returnBps) || returnBps < MIN_POSSIBLE_RETURN_BPS) {
+    throw new AresError(
+      'MARKET_REPORT_IMPOSSIBLE_RETURN',
+      `window return ${String(returnBps)}bps is below -100%: an unleveraged long cannot lose more than ` +
+        `the capital deployed, so this is a defect in the sizing or cost arithmetic, not a market outcome`,
+      { returnBps, ...ctx },
+    );
+  }
+  return returnBps;
+}
+
+/** The same check over a finished distribution, for callers that build one themselves. */
+export function assertUnleveragedDistribution(d: WindowDistribution): WindowDistribution {
+  for (let i = 0; i < d.returnsBps.length; i++) {
+    assertUnleveragedReturnBps(d.returnsBps[i] as number, {
+      symbol: d.symbol,
+      venue: d.venue,
+      windowIndex: i,
+      windowSessions: d.windowSessions,
+      notionalMinor: d.notionalMinor,
+    });
+  }
+  return d;
+}
+
+/**
  * The distribution of buy-and-hold outcomes over EVERY rolling window of the run's
  * length in the available history. This is the base rate the single observed run
  * has to be judged against; without it, a +12% fortnight looks like skill and a
  * -12% fortnight looks like failure, when both may be ordinary noise.
+ *
+ * SIZED, NOT ONE SHARE. Each window buys floor(notionalMinor / entry price) whole
+ * lots and is skipped when that is less than one lot — a window the operator's
+ * capital could not have taken is not an outcome, and counting it as one at a
+ * size nobody would trade misreports the base rate in the direction of despair.
+ * The cost model is unchanged and charged on the REAL quantity: commission both
+ * sides (floored at the venue minimum), half-spread and slippage inside the fill
+ * price on both sides.
  */
 export async function windowDistribution(
   feed: PriceFeed,
   inst: InstrumentRef,
   windowSessions: number,
-  opts: { targetBps?: number; costs?: VenueCostModel; fromDay?: string; toDay?: string } = {},
+  opts: {
+    targetBps?: number;
+    costs?: VenueCostModel;
+    fromDay?: string;
+    toDay?: string;
+    /** Capital deployed per window, in the VENUE's minor units. */
+    notionalMinor?: Minor;
+  } = {},
 ): Promise<WindowDistribution> {
   if (!Number.isInteger(windowSessions) || windowSessions < 2) {
     throw new AresError('MARKET_REPORT_BAD_WINDOW', `windowDistribution: windowSessions must be >= 2`, {
       windowSessions,
     });
   }
+  const notionalMinor = opts.notionalMinor ?? DEFAULT_WINDOW_NOTIONAL_MINOR;
+  if (!Number.isSafeInteger(notionalMinor) || notionalMinor <= 0) {
+    throw new AresError(
+      'MARKET_REPORT_BAD_NOTIONAL',
+      `windowDistribution: notionalMinor must be a positive integer minor amount, got ${String(notionalMinor)}`,
+      { notionalMinor, symbol: inst.symbol, venue: inst.venue },
+    );
+  }
   const costs = opts.costs ?? DEFAULT_COSTS[inst.venue];
+  const lot = Math.max(1, Math.trunc(costs.lotSize));
+  const cur = VENUE_CURRENCY[inst.venue];
   const target = opts.targetBps ?? 10_000; // +100%
   const bars = await feed.bars(
     inst.symbol,
@@ -363,17 +464,43 @@ export async function windowDistribution(
     opts.toDay ?? '9999-12-31',
   );
   const returns: number[] = [];
+  let skipped = 0;
   for (let i = 0; i + windowSessions <= bars.length; i++) {
     const entryBar = bars[i + 1];
     const exitBar = bars[i + windowSessions - 1];
     if (entryBar === undefined || exitBar === undefined) continue;
     const entry = modelFill('BUY', entryBar, null, costs);
     const exit = modelFill('SELL', { ...exitBar, openMinor: exitBar.closeMinor }, null, costs);
-    const qty = 1;
+    if (!entry.filled || !exit.filled || entry.priceMinor <= 0) {
+      skipped++;
+      continue;
+    }
+    // The position the stated capital actually buys, in whole lots.
+    const qty = Math.floor(Math.floor(notionalMinor / entry.priceMinor) / lot) * lot;
+    if (qty < 1) {
+      skipped++;
+      continue;
+    }
     const inCost = entry.priceMinor * qty + commissionMinor(entry.priceMinor * qty, costs);
     const outCash = exit.priceMinor * qty - commissionMinor(exit.priceMinor * qty, costs);
-    if (inCost <= 0) continue;
-    returns.push(Math.round(((outCash - inCost) * 10_000) / inCost));
+    if (inCost <= 0) {
+      skipped++;
+      continue;
+    }
+    returns.push(
+      assertUnleveragedReturnBps(Math.round(((outCash - inCost) * 10_000) / inCost), {
+        symbol: inst.symbol,
+        venue: inst.venue,
+        entryDay: entryBar.dayUtc,
+        exitDay: exitBar.dayUtc,
+        qty,
+        notionalMinor,
+        entryPriceMinor: entry.priceMinor,
+        exitPriceMinor: exit.priceMinor,
+        inCostMinor: inCost,
+        outCashMinor: outCash,
+      }),
+    );
   }
   const sorted = [...returns].sort((a, b) => a - b);
   const pct = (q: number): number => (sorted.length === 0 ? 0 : (sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] as number));
@@ -384,6 +511,9 @@ export async function windowDistribution(
     windowSessions,
     windows: returns.length,
     returnsBps: returns,
+    notionalMinor,
+    skippedWindows: skipped,
+    basis: windowBasisNote(notionalMinor, cur, lot, skipped),
     minBps: sorted.length === 0 ? 0 : (sorted[0] as number),
     p10Bps: pct(0.1),
     medianBps: pct(0.5),
@@ -394,6 +524,18 @@ export async function windowDistribution(
     fractionAtTarget: returns.length === 0 ? 0 : returns.filter((r) => r >= target).length / returns.length,
     targetBps: target,
   };
+}
+
+/** The sizing basis in words. Quoted in the report beside every base rate. */
+export function windowBasisNote(notionalMinor: Minor, cur: Currency, lotSize: number, skipped: number): string {
+  return (
+    `position size ${fmt(money(notionalMinor, cur))} per window ` +
+    `(floor(capital / entry price) whole shares, lot size ${lotSize}), commission charged both sides on the ` +
+    `real quantity and floored at the venue minimum, half-spread and slippage inside both fills` +
+    (skipped > 0
+      ? `; ${skipped} window(s) skipped because that capital did not buy one lot at the entry price`
+      : '')
+  );
 }
 
 /* ------------------------------------------------------------- the report */
@@ -457,18 +599,32 @@ export function buildRunReport(input: RunReportInput): RunReport {
           `nothing arrived.`;
   const honesty = [
     SAMPLE_SIZE_WARNING,
-    ...input.distributions.map(
-      (d) =>
-        `${d.symbol} (${d.venue}): over ${d.windows} historical ${d.windowSessions}-session windows, ` +
-        `buy-and-hold returned between ${bps(d.minBps)} and ${bps(d.maxBps)}, median ${bps(d.medianBps)}; ` +
-        `${(d.fractionPositive * 100).toFixed(1)}% of windows were positive and ` +
-        `${(d.fractionAtTarget * 100).toFixed(2)}% reached ${bps(d.targetBps)}.`,
+    ...input.distributions.map((d) =>
+      d.windows === 0
+        ? `${d.symbol} (${d.venue}): NO ${d.windowSessions}-session window could be evaluated ` +
+          `(${d.skippedWindows} skipped). There is no base rate to quote for this instrument, and the ` +
+          `absence of a number is not a small number. SIZE BASIS: ${d.basis}.`
+        : `${d.symbol} (${d.venue}): over ${d.windows} historical ${d.windowSessions}-session windows, ` +
+          `buy-and-hold returned between ${bps(d.minBps)} and ${bps(d.maxBps)}, median ${bps(d.medianBps)}; ` +
+          `${(d.fractionPositive * 100).toFixed(1)}% of windows were positive and ` +
+          `${(d.fractionAtTarget * 100).toFixed(2)}% reached ${bps(d.targetBps)}. ` +
+          `SIZE BASIS: ${d.basis}.`,
     ),
     input.distributions.length === 0
       ? 'No window distribution was computed — the report cannot show the base rate, so treat the headline as uninterpretable.'
       : `Fraction of historical windows that reached the +100% target: ` +
         `${input.distributions.map((d) => `${d.symbol} ${(d.fractionAtTarget * 100).toFixed(2)}%`).join(', ')}. ` +
         `That is the real base rate for the target named, and it is what a ten-session run is being asked to hit.`,
+    ...(input.distributions.length === 0
+      ? []
+      : [
+          `A BASE RATE IS A NUMBER PER POSITION SIZE, NOT A PROPERTY OF THE HISTORY. Each window above ` +
+            `deploys a stated amount of capital and buys the whole shares it covers; commission is charged ` +
+            `on both sides at the real quantity and is floored at the venue minimum, so the SAME history ` +
+            `quoted on a smaller position returns less. Sizes used: ` +
+            `${input.distributions.map((d) => `${d.symbol} ${fmt(money(d.notionalMinor, VENUE_CURRENCY[d.venue]))}`).join(', ')}. ` +
+            `Windows the capital could not have bought one lot in are excluded, not counted as losses.`,
+        ]),
   ];
   return {
     ...input,
